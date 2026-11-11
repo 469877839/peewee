@@ -2376,6 +2376,42 @@ Model
    See :ref:`relationships` for additional discussion.
 
 
+.. class:: IdentityMap()
+
+   Explicit, per-thread scope that reuses model instances by primary key.
+   While the scope is active, model queries resolve each row to the same
+   Python object for a given model class and primary-key value, across
+   separate queries and joined queries. Leaving the scope releases every
+   cached instance, so the cache never becomes a process-level global.
+   Nested scopes are independent and do not share entries.
+
+   Usable as a context manager or as a decorator:
+
+   .. code-block:: python
+
+       with IdentityMap():
+           user = User.get_by_id(1)
+           assert user is User.get(User.id == 1)
+
+   Rows that cannot be identified - models without a primary key, partial
+   projections missing primary-key columns, or the null side of an outer
+   join - are returned as standalone instances and are not cached. See
+   :ref:`querying` for the full merging rules.
+
+   .. py:classmethod:: current()
+
+      Return the active :class:`IdentityMap`, or ``None`` when no scope is
+      active.
+
+   .. py:method:: resolve(model, pk)
+
+      Return the cached instance for ``(model, pk)``, or ``None``.
+
+   .. py:method:: store(model, pk, instance)
+
+      Cache ``instance`` under ``(model, pk)`` and return it.
+
+
 .. class:: Metadata(model, database=None, table_name=None, indexes=None, primary_key=None, constraints=None, schema=None, only_save_dirty=False, depends_on=None, options=None, without_rowid=False, strict_tables=None, **kwargs)
 
    :param Model model: Model class.

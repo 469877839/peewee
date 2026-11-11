@@ -31,6 +31,8 @@ from . import transactions
 MODULES.append(transactions)
 from . import with_related_tests
 MODULES.append(with_related_tests)
+from . import identity_map
+MODULES.append(identity_map)
 
 # Extensions.
 try:

@@ -81,6 +81,72 @@ fields. Peewee reconstructs the model graph from the result set:
    :ref:`relationships` covers joins in detail.
 
 
+Identity Map
+------------
+
+By default every query materializes a fresh set of Python objects: two
+``get()`` calls for the same row return two different instances, so values
+cleaned onto one object are not visible on the other. An :class:`IdentityMap`
+is an explicit scope that instead reuses one instance per model class and
+primary-key value for the duration of the ``with`` block:
+
+.. code-block:: python
+
+   from peewee import IdentityMap
+
+   with IdentityMap():
+       user = User.get_by_id(1)
+       same_user = User.get(User.id == 1)
+       assert user is same_user  # One object, reused across queries.
+
+       # Joined queries share the same instances too.
+       tweet = (Tweet
+                .select(Tweet, User)
+                .join(User)
+                .where(Tweet.id == 5)
+                .get())
+       assert tweet.user is user
+
+The scope is per-thread and nothing is stored globally. Each
+:class:`IdentityMap` owns its own cache, nested scopes do not share entries,
+and leaving the scope releases every instance it held:
+
+.. code-block:: python
+
+   with IdentityMap() as outer:
+       a = User.get_by_id(1)
+       with IdentityMap() as inner:
+           b = User.get_by_id(1)
+           assert a is not b  # Inner scope has its own copy.
+       assert User.get_by_id(1) is a  # Outer scope unchanged.
+   # `outer` is empty again here and no cache remains on the process.
+
+The scope can also wrap a function or method as a decorator
+(``@IdentityMap()``). Queries outside any scope behave exactly as before.
+
+Merging rules
+^^^^^^^^^^^^^
+
+When a later row maps to an already-cached instance:
+
+- **Fields the user changed locally** (the instance's dirty fields) always
+  win. The database value is ignored and the field stays dirty, so an
+  unsaved edit is never silently overwritten.
+- **Other fields are refreshed** with the values from the new row and remain
+  clean. Fields the new row does not select are left untouched, so a partial
+  projection only fills in what it contains.
+- **Primary-key columns are never rewritten**: identity is derived from them,
+  so an edited primary key remains exactly as the user set it.
+- A **composite primary key** works the same way, keyed on the tuple of its
+  parts; if any part is missing from the row, the row cannot be identified.
+- Rows without a usable key are never merged: models without a primary key,
+  projections that do not include every primary-key column (including an
+  aliased primary key), and the all-null side of an outer join. Such rows are
+  returned as standalone instances and are not entered into the cache.
+- A model alias is another view of the same entity: an aliased table shares
+  the cache entry of its underlying model class and primary key.
+
+
 Retrieving a Single Record
 --------------------------
 

@@ -111,6 +111,7 @@ __all__ = [
     'fn',
     'ForeignKeyField',
     'IdentityField',
+    'IdentityMap',
     'ImproperlyConfigured',
     'Index',
     'IntegerField',
@@ -9005,6 +9006,144 @@ def _resolve_model_columns(cursor, model, select):
     return columns, fields, converters, no_convert, convert
 
 
+class IdentityMap(_callable_context_manager):
+    """Explicit, per-thread scope that reuses model instances by primary key.
+
+    While an IdentityMap is active, model queries returning model instances
+    resolve each row to the same Python object for a given model class and
+    primary-key value, even across separate queries and joined queries. The
+    cache lives on the IdentityMap instance itself; leaving the scope drops
+    every reference it holds, so an IdentityMap never becomes a process-level
+    global. Nested scopes are independent: each scope owns the instances
+    materialized while it is active, and an inner scope does not see the
+    outer scope's cache.
+    """
+    _state = threading.local()
+
+    def __init__(self):
+        self._entities = {}
+
+    @classmethod
+    def current(cls):
+        """Return the active IdentityMap, or None when no scope is active."""
+        stack = getattr(cls._state, 'stack', None)
+        if stack:
+            return stack[-1]
+        return None
+
+    def __enter__(self):
+        stack = getattr(self._state, 'stack', None)
+        if stack is None:
+            stack = self._state.stack = []
+        stack.append(self)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        stack = self._state.stack
+        stack.pop()
+        if not stack:
+            del self._state.stack
+        self._entities.clear()  # Release all cached instances on scope exit.
+
+    def resolve(self, model, pk):
+        """Return the cached instance for (model, pk), or None."""
+        return self._entities.get((model, pk))
+
+    def store(self, model, pk, instance):
+        self._entities[(model, pk)] = instance
+        return instance
+
+    def __len__(self):
+        return len(self._entities)
+
+    def __contains__(self, item):
+        return item in self._entities
+
+
+def _pk_field_names(model):
+    pk = model._meta.primary_key
+    if pk is False:
+        return None
+    if model._meta.composite_key:
+        return tuple(pk.field_names)
+    return (pk.name,)
+
+
+def _field_name(field):
+    # A FieldAlias (from a ModelAlias select) keeps the field name; a plain
+    # aliased expression never reaches here because its index is in the
+    # caller's aliased-index set.
+    return field.field.name if isinstance(field, FieldAlias) else field.name
+
+
+def _aliased_indexes(select):
+    # Columns wrapped with .alias('x') are exposed under the alias name, so
+    # they cannot be matched back to the model's fields.
+    return frozenset(idx for idx, node in enumerate(select)
+                     if isinstance(node, Node) and node.is_alias())
+
+
+def _row_identity(model, fields, row, converters, aliased):
+    """Compute the primary-key value from a raw row when all PK columns are
+    present and non-null.
+
+    Returns None when the row cannot be merged into the identity scope: a
+    model without a primary key, a partial projection missing PK columns, or
+    an outer-join row whose (all-null) side has no real record.
+    """
+    pk_names = _pk_field_names(model)
+    if pk_names is None:
+        return None
+    indexes = {}
+    for idx, field in enumerate(fields):
+        if field is not None and idx not in aliased:
+            name = _field_name(field)
+            if name in pk_names:
+                indexes[name] = idx
+    if not all(name in indexes for name in pk_names):
+        return None
+    pk_values = []
+    for name in pk_names:
+        idx = indexes[name]
+        value = row[idx]
+        converter = converters[idx]
+        if converter is not None:
+            value = converter(value)
+        if value is None:
+            return None
+        pk_values.append(value)
+    return pk_values[0] if len(pk_values) == 1 else tuple(pk_values)
+
+
+def _merge_loaded_row(instance, fields, row, converters, aliased):
+    """Merge one freshly-loaded database row into an existing instance.
+
+    Rules:
+    - A field the user has changed locally (present in _dirty) always wins;
+      the database value is neither applied nor does it clear the dirty flag.
+    - Any other field is refreshed with the database value, and is kept clean
+      (the row as read reflects database state).
+    - Primary-key columns are never rewritten through a merge: identity is
+      established from them, so a changed local primary key stays dirty and
+      untouched.
+    """
+    skipped = set(instance._dirty)
+    pk_names = _pk_field_names(type(instance)) or ()
+    data = instance.__data__
+    for idx, field in enumerate(fields):
+        if field is None or idx in aliased:
+            continue
+        name = _field_name(field)
+        if name in skipped or name in pk_names:
+            continue
+        value = row[idx]
+        if converters[idx] is not None:
+            value = converters[idx](value)
+        if data.get(name) != value:
+            data[name] = value
+        instance._dirty.discard(name)
+
+
 class BaseModelCursorWrapper(DictCursorWrapper):
     def __init__(self, cursor, model, columns):
         super(BaseModelCursorWrapper, self).__init__(cursor)
@@ -9066,12 +9205,39 @@ class ModelObjectCursorWrapper(ModelDictCursorWrapper):
         self.is_model = is_model(constructor)
         super(ModelObjectCursorWrapper, self).__init__(cursor, model, select)
 
+    def initialize(self):
+        super(ModelObjectCursorWrapper, self).initialize()
+        self._aliased = _aliased_indexes(self.select)
+
     def process_row(self, row):
         result = super(ModelObjectCursorWrapper, self).process_row(row)
         if self.is_model:
-            # Clear out any dirty fields before returning to the user.
-            obj = self.constructor(__no_default__=1, **result)
-            obj._dirty.clear()
+            scope = IdentityMap.current()
+            if scope is not None:
+                identity = _row_identity(self.constructor, self.fields, row,
+                                         self.converters, self._aliased)
+            else:
+                identity = None
+            if identity is None:
+                # No active scope, or the projection lacks the full primary
+                # key: build a standalone instance and do not cache it.
+                obj = self.constructor(__no_default__=1, **result)
+                obj._dirty.clear()
+                return obj
+            # An alias is another view of the same entity, so the identity
+            # key uses the underlying model class.
+            key_model = (self.constructor.model
+                         if isinstance(self.constructor, ModelAlias)
+                         else self.constructor)
+            obj = scope.resolve(key_model, identity)
+            if obj is None:
+                obj = self.constructor(__no_default__=1, **result)
+                obj._dirty.clear()
+                scope.store(key_model, identity, obj)
+            else:
+                # The row may carry only a subset of the model's fields.
+                _merge_loaded_row(obj, self.fields, row, self.converters,
+                                  self._aliased)
             return obj
         else:
             return self.constructor(**result)
@@ -9161,6 +9327,38 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
             (i, self.column_keys[i], columns[i], self.converters[i])
             for i in range(self.ncols))
 
+        # Per-source column specs and field references, used to merge rows of
+        # joined models into an IdentityMap's canonical instances.
+        self._aliased = _aliased_indexes(self.select)
+        self._key_columns = collections.defaultdict(list)
+        for idx, key in enumerate(self.column_keys):
+            self._key_columns[key].append((idx, columns[idx],
+                                           self.converters[idx],
+                                           self.fields[idx]))
+        self._key_model = {}
+        self._key_pk_names = {}
+        for key, (constructor, _is_model) in self.key_to_constructor.items():
+            if _is_model:
+                self._key_model[key] = constructor
+                self._key_pk_names[key] = _pk_field_names(constructor) or ()
+        self._key_identity = {}
+        scope = IdentityMap.current()
+        if scope is not None:
+            for key, model in self._key_model.items():
+                specs = self._key_columns[key]
+                pk_names = self._key_pk_names[key]
+                if not pk_names:
+                    continue
+                pk_indexes = {}
+                for idx, column, converter, field in specs:
+                    if field is not None and idx not in self._aliased:
+                        name = _field_name(field)
+                        if name in pk_names:
+                            pk_indexes[name] = (idx, converter)
+                if all(name in pk_indexes for name in pk_names):
+                    self._key_identity[key] = tuple(
+                        pk_indexes[name] for name in pk_names)
+
         # Flatten list of key / constructor / is model? flag.
         self._constructor_list = [
             (key, construct, _is_model)
@@ -9193,14 +9391,40 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
         self.src_to_dest = keep
 
     def process_row(self, row):
+        scope = IdentityMap.current()
         objects = {}
         model_list = []
+        canonical = {}  # Sources whose per-row instance came from the scope.
         for key, constructor, _is_model in self._constructor_list:
-            if _is_model:
-                objects[key] = constructor(__no_default__=True)
-                model_list.append(objects[key])
-            else:
+            if not _is_model:
                 objects[key] = constructor()
+                continue
+            pk = None
+            if scope is not None and key in self._key_identity:
+                pk_values = []
+                for idx, converter in self._key_identity[key]:
+                    value = row[idx]
+                    if converter is not None:
+                        value = converter(value)
+                    if value is None:
+                        # Outer-join "empty" row: no record to key on.
+                        pk_values = None
+                        break
+                    pk_values.append(value)
+                if pk_values is not None:
+                    pk = (pk_values[0] if len(pk_values) == 1
+                          else tuple(pk_values))
+            if pk is not None:
+                instance = scope.resolve(constructor, pk)
+                if instance is not None:
+                    objects[key] = instance
+                    canonical[key] = instance
+                    continue
+            instance = constructor(__no_default__=True)
+            objects[key] = instance
+            model_list.append(instance)
+            if pk is not None:
+                scope.store(constructor, pk, instance)
 
         default_instance = objects[self.model]
 
@@ -9217,6 +9441,18 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
 
             if isinstance(instance, dict):
                 instance[column] = value
+            elif key in canonical:
+                field = self.fields[idx]
+                if field is None or idx in self._aliased:
+                    setattr(instance, column, value)
+                    continue
+                name = _field_name(field)
+                # Locally modified fields always win over database values.
+                if name in instance._dirty or name in self._key_pk_names[key]:
+                    continue
+                if instance.__data__.get(name) != value:
+                    instance.__data__[name] = value
+                instance._dirty.discard(name)
             else:
                 setattr(instance, column, value)
 
@@ -9247,13 +9483,20 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
 
             if is_dict:
                 instance[attr] = joined_instance
+            elif is_fk and src in canonical:
+                # A reused instance keeps its own (possibly locally changed)
+                # fk value. For a clean fk, refresh the relation cache only -
+                # None marks a verified-absent row - without marking it dirty.
+                if attr not in instance._dirty:
+                    instance.__rel__[attr] = joined_instance
             elif is_fk and joined_instance is None:
                 # None in __rel__ marks a verified-absent row, fk id intact.
                 instance.__rel__[attr] = None
             else:
                 setattr(instance, attr, joined_instance)
 
-        # When instantiating models from a cursor, we clear the dirty fields.
+        # Newly materialized instances reflect database state: clear dirty.
+        # Reused (canonical) instances keep any locally modified fields.
         for instance in model_list:
             instance._dirty.clear()
 

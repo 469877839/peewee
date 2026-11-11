@@ -7,6 +7,13 @@ https://github.com/coleifer/peewee/releases
 
 ## master
 
+* Add `IdentityMap`, an explicit per-thread scope (context manager or
+  decorator) that reuses model instances by model class and primary key across
+  separate queries, joins, aliases and composite keys. Locally modified fields
+  always win over database values; projections without a full primary key are
+  not merged. The cache is released on scope exit and nested scopes are
+  independent.
+
 [View commits](https://github.com/coleifer/peewee/compare/4.5.3...master)
 
 ## 4.5.3
