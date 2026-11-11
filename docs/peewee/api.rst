@@ -762,6 +762,27 @@ Database
                    # ... models are bound to test database ...
                    pass
 
+   .. method:: use(models, bind_refs=True, bind_backrefs=True)
+
+       :param list models: List of models to bind to the database.
+       :param bool bind_refs: Bind models that are referenced using
+           foreign-keys.
+       :param bool bind_backrefs: Bind models that reference the given model
+           with a foreign-key.
+
+       Return a context-manager (usable as a decorator) that binds the given
+       models to the database for the duration of the wrapped block **without
+       rewriting model metadata**. The binding is thread-local and is consulted
+       at query-execution time, so it is safe to interleave work against
+       multiple databases in one process. Nested blocks, including ones exited
+       by an exception, restore the previous binding. See
+       :ref:`context_local_binding` for the binding priority rules.
+
+       .. code-block:: python
+
+           with test_db.use([User, Tweet]):
+               User.create(username='zaizee')
+
    .. method:: extract_date(date_part, date_field)
 
       :param str date_part: date part to extract, e.g. 'year'.
@@ -2182,6 +2203,22 @@ Model
 
       See also: :meth:`Database.bind_ctx`.
 
+   .. classmethod:: use(database, bind_refs=True, bind_backrefs=True)
+
+      Return a context-manager (usable as a decorator) that registers a
+      thread-local binding for the model and, optionally, its related models.
+      The model's metadata is never modified, and queries created outside the
+      block still run against ``database`` if they are executed inside it. An
+      explicitly-bound query (``query.bind(db)``) takes precedence. See
+      :ref:`context_local_binding` for the complete priority rules.
+
+      .. code-block:: python
+
+          with User.use(analytics_db):
+              User.create(username='zaizee')  # lands in analytics_db
+
+          # Metadata database is unchanged after the block.
+
    .. classmethod:: table_exists()
 
       :return: boolean indicating whether the table exists.
@@ -2442,8 +2479,20 @@ Model
 
          * :meth:`Model.bind`
          * :meth:`Model.bind_ctx` (bind for scope of a context manager).
+         * :meth:`Model.use` (thread-local binding, no metadata rewrite).
          * :meth:`Database.bind`
          * :meth:`Database.bind_ctx`
+         * :meth:`Database.use`
+
+   .. method:: resolve_database()
+
+      :return: the :class:`Database` the model's queries, schema operations
+          and transactions will run against, or ``None`` if unbound.
+
+      Single entry-point for database resolution. A thread-local binding
+      registered with :meth:`Model.use` / :meth:`Database.use` takes
+      precedence over the statically-bound ``database`` attribute. Note that
+      an explicitly-bound query (``query.bind(db)``) still overrides both.
 
    .. method:: set_table_name(table_name)
 

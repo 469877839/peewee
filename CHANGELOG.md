@@ -9,6 +9,18 @@ https://github.com/coleifer/peewee/releases
 
 [View commits](https://github.com/coleifer/peewee/compare/4.5.3...master)
 
+* Add context-local, thread-safe database bindings via `Model.use()` and
+  `Database.use()`. Unlike `bind()`/`bind_ctx()`, these never rewrite model
+  metadata: the binding is consulted at query-execution time, so queries
+  created before entering the block follow the active context, and multiple
+  databases can be interleaved in one process. Nested blocks and exception
+  exits restore the previous binding. Explicit `query.bind(db)` (and the
+  `database=` argument to `execute()`) still takes precedence.
+* Consolidate model database resolution into `Metadata.resolve_database()`,
+  now shared by model queries, schema operations, `get_or_create()`, raw
+  queries and the async helpers. Model queries no longer freeze
+  `_meta.database` at creation time.
+
 ## 4.5.3
 
 * JSON path keys on Postgres are rendered inline (`data->>'key'`,

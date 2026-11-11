@@ -8,11 +8,13 @@ import gc
 import os
 import platform
 import re
+import tempfile
 import threading
 import time
 import warnings
 
 from peewee import *
+from peewee import _context_bound_dbs
 from peewee import Database
 from peewee import FIELD
 from peewee import attrdict
@@ -407,6 +409,406 @@ class TestDatabase(DatabaseTestCase):
         result = do_work()
         self.assertEqual(result, (1,))
         self.assertTrue(db2.is_closed())
+
+
+class TestContextLocalBinding(BaseTestCase):
+    """Verify ``Model.use()`` / ``Database.use()`` bind by context.
+
+    Two on-disk SQLite files are used so that queries truly land in
+    different databases and connection ownership can be inspected.
+    """
+    def setUp(self):
+        super(TestContextLocalBinding, self).setUp()
+        self.paths = []
+        self.db_a = self._new_db()
+        self.db_b = self._new_db()
+        for database in (self.db_a, self.db_b):
+            database.execute_sql(
+                'CREATE TABLE "exportitem" '
+                '(id INTEGER PRIMARY KEY, name TEXT, tag TEXT)')
+
+    def _new_db(self):
+        fd, path = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+        os.unlink(path)  # Let SQLite create the file fresh.
+        self.paths.append(path)
+        return SqliteDatabase(path)
+
+    def tearDown(self):
+        self.db_a.close()
+        self.db_b.close()
+        for path in self.paths:
+            if os.path.exists(path):
+                os.unlink(path)
+        super(TestContextLocalBinding, self).tearDown()
+
+    def counts(self):
+        return (self.db_a.execute_sql('SELECT COUNT(*) FROM "exportitem"'
+                                      ).fetchone()[0],
+                self.db_b.execute_sql('SELECT COUNT(*) FROM "exportitem"'
+                                      ).fetchone()[0])
+
+    def test_metadata_not_rewritten(self):
+        # The binding lives in the context, never in the model metadata.
+        class ExportItem(Model):
+            name = TextField()
+            tag = TextField()
+
+            class Meta:
+                database = self.db_a
+
+        self.assertIs(ExportItem._meta.database, self.db_a)
+        with ExportItem.use(self.db_b):
+            self.assertIs(ExportItem._meta.database, self.db_a)
+            self.assertIs(
+                ExportItem._meta.resolve_database(), self.db_b)
+            ExportItem._meta.table  # force table construction.
+            self.assertIs(ExportItem._meta.table._database, self.db_a)
+        self.assertIs(ExportItem._meta.database, self.db_a)
+        self.assertIs(ExportItem._meta.resolve_database(), self.db_a)
+
+    def test_interleaved_execution(self):
+        class ExportItem(Model):
+            name = TextField()
+            tag = TextField()
+
+            class Meta:
+                database = self.db_a
+
+        # Queries created *outside* any context follow the context in
+        # effect when they are executed, not when they were built.
+        prebuilt_a = ExportItem.select().where(ExportItem.tag == 'a')
+        prebuilt_insert = ExportItem.insert(name='a2', tag='a')
+
+        with ExportItem.use(self.db_a):
+            prebuilt_a.execute()
+            ExportItem.create(name='a1', tag='a')
+        with ExportItem.use(self.db_b):
+            ExportItem.create(name='b1', tag='b')
+
+        # Interleave: build queries for one database and execute them in
+        # the other's context, then flip back.
+        prebuilt_b = ExportItem.select().where(ExportItem.tag == 'b')
+        for qa, qb in ((prebuilt_a, prebuilt_b),
+                       (ExportItem.select().where(ExportItem.tag == 'a'),
+                        ExportItem.select().where(ExportItem.tag == 'b'))):
+            with ExportItem.use(self.db_b):
+                self.assertEqual([row[2] for row in qb.tuples()], ['b'])
+            self.assertEqual([row[2] for row in qa.tuples()], ['a'])
+            with ExportItem.use(self.db_b):
+                self.assertEqual([row[2] for row in qa.tuples()], [])
+
+        with ExportItem.use(self.db_b):
+            prebuilt_insert.execute()
+
+        self.assertEqual(self.counts(), (1, 2))
+        self.assertEqual(
+            [row[1] for row in ExportItem.select().tuples()], ['a1'])
+        with ExportItem.use(self.db_b):
+            self.assertEqual(
+                sorted(row[1] for row in ExportItem.select().tuples()),
+                ['a2', 'b1'])
+
+        # Nothing leaked into the statically-bound database metadata.
+        self.assertIs(ExportItem._meta.database, self.db_a)
+
+    def test_explicit_query_bind_wins(self):
+        class ExportItem(Model):
+            name = TextField()
+
+            class Meta:
+                database = self.db_a
+
+        ExportItem.create(name='static')
+        explicit = ExportItem.select().where(ExportItem.name == 'static')
+        explicit = explicit.bind(self.db_b)
+
+        # Even inside a use() for the other database, an explicitly-bound
+        # query executes against its own database.
+        with ExportItem.use(self.db_b):
+            self.assertEqual(list(explicit.tuples()), [])
+            self.assertEqual(self.counts(), (1, 0))
+            # And `database=` to execute() wins as well.
+            rows = list(
+                ExportItem.select().where(
+                    ExportItem.name == 'static').tuples().execute(
+                    self.db_a))
+            self.assertEqual(rows, [(1, 'static')])
+
+        # The explicit binding survives leaving the context.
+        self.assertEqual(list(explicit.tuples()), [])
+
+    def test_related_models_follow_context(self):
+        class ExportCategory(Model):
+            label = TextField()
+
+            class Meta:
+                database = self.db_a
+                table_name = 'export_category'
+
+        class ExportItem(Model):
+            name = TextField()
+            category = ForeignKeyField(ExportCategory, backref='items')
+
+            class Meta:
+                database = self.db_a
+                table_name = 'export_item_fk'
+
+        with ExportCategory.use(self.db_b):
+            self.db_b.create_tables([ExportCategory, ExportItem])
+
+        with ExportCategory.use(self.db_a):
+            self.db_a.create_tables([ExportCategory, ExportItem])
+        with ExportCategory.use(self.db_b):
+            ExportCategory.create(label='b')
+            ExportItem.create(name='child-b', category=ExportCategory.get())
+        ExportCategory.create(label='a')  # statically bound to db_a.
+
+        def join_rows():
+            return [(item.name, item.category.label)
+                    for item in (ExportItem
+                                 .select(ExportItem, ExportCategory)
+                                 .join(ExportCategory))]
+
+        # Both the base model and the joined relation resolve to db_b.
+        with ExportCategory.use(self.db_b):
+            self.assertEqual(join_rows(), [('child-b', 'b')])
+        self.assertEqual(join_rows(), [])
+
+        # bind_refs=False keeps the related model on its own binding.
+        with ExportItem.use(self.db_b, bind_refs=False):
+            self.assertIs(
+                ExportItem._meta.resolve_database(), self.db_b)
+            self.assertIs(
+                ExportCategory._meta.resolve_database(), self.db_a)
+
+        # prefetch() issues its subqueries against the context database too.
+        with ExportCategory.use(self.db_b):
+            categories = prefetch(ExportCategory.select(),
+                                  ExportItem.select())
+            self.assertEqual(
+                [(c.label, [i.name for i in c.items]) for c in categories],
+                [('b', ['child-b'])])
+        self.assertEqual(
+            [(c.label, [i.name for i in c.items])
+             for c in prefetch(ExportCategory.select(), ExportItem.select())],
+            [('a', [])])
+
+    def test_proxy_database(self):
+        proxy = DatabaseProxy()
+
+        class ExportItem(Model):
+            name = TextField()
+
+            class Meta:
+                database = proxy
+
+        proxy.initialize(self.db_a)
+        self.db_a.create_tables([ExportItem])
+        ExportItem.create(name='static')
+        self.assertEqual(ExportItem.select().count(), 1)
+
+        item = ExportItem.get()
+        row = (item.id, item.name)
+
+        # A context binding takes precedence over the proxy target. Rebinding
+        # through the proxy would otherwise require mutating the metadata.
+        with ExportItem.use(self.db_b):
+            self.assertEqual(ExportItem.select().count(), 0)
+            ExportItem.insert(id=row[0], name=row[1]).execute()
+            self.assertEqual(
+                [r[1] for r in ExportItem.select().tuples()], ['static'])
+            self.assertEqual(
+                self.db_b.execute_sql('SELECT COUNT(*) FROM exportitem'
+                                      ).fetchone()[0], 1)
+        self.assertEqual(ExportItem.select().count(), 1)
+        self.assertEqual(
+            self.db_b.execute_sql('SELECT COUNT(*) FROM exportitem'
+                                  ).fetchone()[0], 1)
+        self.assertEqual(proxy.obj, self.db_a)
+
+    def test_raw_queries_follow_context(self):
+        class ExportItem(Model):
+            name = TextField()
+
+            class Meta:
+                database = self.db_a
+
+        raw = ExportItem.raw('SELECT COUNT(*) FROM exportitem').tuples()
+
+        with ExportItem.use(self.db_a):
+            self.assertEqual(list(raw.clone()), [(0,)])
+            ExportItem.raw('INSERT INTO exportitem (name) VALUES (?)',
+                           'raw-a').execute()
+        with ExportItem.use(self.db_b):
+            self.assertEqual(
+                list(ExportItem.raw('SELECT name FROM exportitem')
+                     .tuples()), [])
+            ExportItem.raw('INSERT INTO exportitem (name) VALUES (?)',
+                           'raw-b').execute()
+            self.assertEqual(list(raw.clone()), [(1,)])
+            # A database-level execute_sql() is unaffected by model context.
+            self.assertIs(
+                ExportItem._meta.resolve_database(), self.db_b)
+
+        self.assertEqual(self.counts(), (1, 1))
+        self.assertEqual(
+            list(ExportItem.raw('SELECT name FROM exportitem').tuples()),
+            [('raw-a',)])
+
+    def test_transactions_follow_context(self):
+        class ExportItem(Model):
+            name = TextField()
+
+            class Meta:
+                database = self.db_a
+
+        with ExportItem.use(self.db_b):
+            db = ExportItem._meta.resolve_database()
+            self.assertIs(db, self.db_b)
+            try:
+                with db.atomic():
+                    ExportItem.create(name='txn-b')
+                    raise ValueError('boom')
+            except ValueError:
+                pass
+            # Rolled back in db_b, db_a untouched.
+            self.assertEqual(self.counts(), (0, 0))
+
+            with db.atomic():
+                ExportItem.create(name='committed-b')
+            self.assertEqual(self.counts(), (0, 1))
+
+        # get_or_create() also resolves its transaction from the context.
+        with ExportItem.use(self.db_b):
+            obj, created = ExportItem.get_or_create(name='got-b')
+            self.assertTrue(created)
+            self.assertEqual(self.counts(), (0, 2))
+        # Now statically bound to db_a - a fresh row, not the db_b one.
+        obj, created = ExportItem.get_or_create(name='got-b')
+        self.assertTrue(created)
+        self.assertEqual(self.counts(), (1, 2))
+
+    def test_nested_and_exception_restore(self):
+        class ExportItem(Model):
+            name = TextField()
+
+            class Meta:
+                database = self.db_a
+
+        self.assertIs(ExportItem._meta.resolve_database(), self.db_a)
+        with ExportItem.use(self.db_b):
+            self.assertIs(ExportItem._meta.resolve_database(), self.db_b)
+            with ExportItem.use(self.db_a):
+                self.assertIs(
+                    ExportItem._meta.resolve_database(), self.db_a)
+                try:
+                    with ExportItem.use(self.db_b):
+                        self.assertIs(
+                            ExportItem._meta.resolve_database(), self.db_b)
+                        self.assertEqual(ExportItem.select().count(), 0)
+                        raise ValueError('boom')
+                except ValueError:
+                    pass
+                self.assertIs(
+                    ExportItem._meta.resolve_database(), self.db_a)
+            self.assertIs(ExportItem._meta.resolve_database(), self.db_b)
+        self.assertIs(ExportItem._meta.resolve_database(), self.db_a)
+        # No stale frames: an exception that unwinds the whole stack still
+        # leaves the model on its static binding.
+        try:
+            with ExportItem.use(self.db_b):
+                with ExportItem.use(self.db_b):
+                    raise ValueError('boom')
+        except ValueError:
+            pass
+        self.assertIs(ExportItem._meta.resolve_database(), self.db_a)
+        self.assertEqual(len(_context_bound_dbs.stack), 0)
+
+    def test_decorator_and_interface_priority(self):
+        class ExportItem(Model):
+            name = TextField()
+
+            class Meta:
+                database = self.db_a
+
+        @ExportItem.use(self.db_b)
+        def get_db():
+            return ExportItem._meta.resolve_database()
+
+        # use() is re-entrant and can be used as a decorator.
+        self.assertEqual([get_db(), get_db()], [self.db_b, self.db_b])
+
+        # Priority: explicit query bind > use() > static bind/bind_ctx.
+        with ExportItem.bind_ctx(self.db_a):
+            self.assertIs(ExportItem._meta.resolve_database(), self.db_a)
+            with ExportItem.use(self.db_b):
+                self.assertIs(
+                    ExportItem._meta.resolve_database(), self.db_b)
+                bound = ExportItem.select().bind(self.db_a)
+                self.assertEqual(bound._get_database(), self.db_a)
+                self.assertEqual(self.counts(), (0, 0))
+                # Uses its own binding, not the context's.
+                self.assertEqual(list(bound.tuples()), [])
+            self.assertIs(ExportItem._meta.resolve_database(), self.db_a)
+        self.assertIs(ExportItem._meta.database, self.db_a)
+        self.assertIs(ExportItem._meta.resolve_database(), self.db_a)
+
+    def test_connection_ownership_across_threads(self):
+        class ExportItem(Model):
+            name = TextField()
+
+            class Meta:
+                database = self.db_a
+
+        main = self.db_a.connection()
+        self.assertIs(main, self.db_a._state.conn)
+
+        seen = {}
+        errors = []
+
+        def worker(name, database, expected_tag):
+            try:
+                with database.use([ExportItem]):
+                    conn = database.connection()
+                    seen[name] = (id(conn), database, expected_tag)
+                    ExportItem.create(name=expected_tag)
+                    names = [row[1] for row in
+                             ExportItem.select().tuples()]
+                    if expected_tag not in names:
+                        raise AssertionError(
+                            '%s missing from %r' % (expected_tag, names))
+            except Exception as exc:
+                errors.append(exc)
+
+        t1 = threading.Thread(target=worker,
+                              args=('t1', self.db_b, 'thread-b'))
+        t2 = threading.Thread(target=worker,
+                              args=('t2', self.db_b, 'thread-b2'))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        self.assertEqual(errors, [])
+
+        # Each thread sees its own binding and connection; the main thread
+        # still resolves to db_a and never borrowed either worker's conn.
+        self.assertIs(ExportItem._meta.resolve_database(), self.db_a)
+        self.assertIs(self.db_a._state.conn, main)
+        self.assertEqual(self.db_a.execute_sql(
+            'SELECT COUNT(*) FROM exportitem').fetchone()[0], 0)
+        self.assertEqual(self.db_b.execute_sql(
+            'SELECT COUNT(*) FROM exportitem').fetchone()[0], 2)
+
+        order = sorted(seen)
+        self.assertIs(seen[order[0]][1], self.db_b)
+        self.assertIs(seen[order[1]][1], self.db_b)
+        self.assertNotIn(seen[order[0]][0], (id(main), seen[order[1]][0]))
+        self.assertNotIn(seen[order[1]][0], (id(main), seen[order[0]][0]))
+
+        # The context stack is thread-local: workers cleaned up their own
+        # frames without disturbing the main thread's.
+        self.assertEqual(len(_context_bound_dbs.stack), 0)
 
 
 class TestQueryHooks(ModelTestCase):

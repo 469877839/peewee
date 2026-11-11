@@ -349,10 +349,57 @@ for binding a given model class:
    # User is back to being bound to the sqlite_db.
    assert User._meta.database is sqlite_db
 
-Peewee database connections are thread-safe. However, if you plan to **bind**
-the database at run-time in a multi-threaded application, storing the model's
-database in a thread-local is necessary. This can be accomplished with
-the :class:`~playhouse.shortcuts.ThreadSafeDatabaseMetadata`.
+
+.. _context_local_binding:
+
+Context-local bindings
+^^^^^^^^^^^^^^^^^^^^^^
+
+``bind()`` and ``bind_ctx()`` rewrite the model's metadata, which makes them
+unsuitable when the same process interleaves work against multiple databases:
+each switch mutates state that every query shares. Peewee provides a
+context-local alternative:
+
+* :meth:`Model.use` and :meth:`Database.use` register a binding that is local
+  to the current thread and is **never** written into the model metadata.
+* The binding is consulted when a query is **executed**, not when it is
+  created. A query built outside the context still runs against the
+  context database if it is executed inside the block.
+
+.. code-block:: python
+
+   with db_a.use([User, Tweet]):     # or: with User.use(db_a):
+       User.create(username='a')     # lands in db_a
+       with db_b.use([User, Tweet]):
+           User.create(username='b') # lands in db_b
+           # Nested blocks, joins, save()/delete(), raw() and atomic()
+           # all follow the innermost binding.
+       User.create(username='a2')    # back in db_a
+
+   # Outside the block the model resolves to its metadata database again.
+   assert User._meta.database is original_db
+
+Rules for choosing a database, from highest to lowest priority:
+
+1. An explicit binding on the query itself - ``query.bind(db)`` or the
+   ``database=`` argument to ``execute()`` / ``iterator()`` - always wins.
+2. A context-local binding registered by ``Model.use()`` / ``Database.use()``
+   in the current thread (innermost block wins).
+3. The database stored in the model metadata, set with ``Meta.database``,
+   ``Model.bind()`` or ``Model.bind_ctx()``.
+
+The same resolution is used by ``Model.select()``/``insert()``/``update()``/
+``delete()``, foreign-key joins and ``prefetch()``, ``Model.raw()``, instance
+``save()``/``delete_instance()``, schema operations, ``Database.atomic()``
+blocks started through the model, ``get_or_create()`` and the async query
+helpers. Nested blocks - including blocks exited by an exception - restore the
+previous binding. Because the stack is thread-local, a binding created in one
+thread is never visible to another thread, and each thread uses its own
+connection.
+
+If you prefer thread-local model metadata instead of execution-time
+resolution, the :class:`~playhouse.shortcuts.ThreadSafeDatabaseMetadata`
+class is still available.
 
 .. code-block:: python
 

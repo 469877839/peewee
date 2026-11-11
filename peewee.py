@@ -500,6 +500,82 @@ class _callable_context_manager(object):
         return inner
 
 
+class _ContextBoundDatabases(threading.local):
+    """Thread-local stack of model -> database bindings.
+
+    Unlike ``Model.bind()`` / ``Model.bind_ctx()``, which rewrite the model's
+    metadata (``model._meta.database``), bindings registered here are local to
+    the current thread and are consulted at query-execution time. This makes
+    it safe to interleave work against multiple databases in a single process
+    without repeatedly rewriting model metadata.
+    """
+    def __init__(self):
+        self.stack = []
+
+    def push(self, mapping):
+        self.stack.append(mapping)
+
+    def pop(self):
+        # Pop unconditionally so an exception raised while exiting a nested
+        # binding cannot leave stale entries behind.
+        self.stack.pop()
+
+    def resolve(self, model):
+        for mapping in reversed(self.stack):
+            if model in mapping:
+                return mapping[model]
+
+
+_context_bound_dbs = _ContextBoundDatabases()
+
+
+def _resolve_context_database(model):
+    return _context_bound_dbs.resolve(model)
+
+
+class _ModelUseContext(_callable_context_manager):
+    """Context-manager returned by ``Model.use()`` / ``Database.use()``.
+
+    Registers a context-local binding for the given models (and, optionally,
+    their foreign-key related models) without touching the models' metadata.
+    """
+    def __init__(self, models, database, bind_refs=True, bind_backrefs=True):
+        self.models = models
+        self.database = database
+        self.bind_refs = bind_refs
+        self.bind_backrefs = bind_backrefs
+
+    def _build_ctx(self):
+        return type(self)(self.models, self.database, self.bind_refs,
+                          self.bind_backrefs)
+
+    def _collect_models(self):
+        if not (self.bind_refs or self.bind_backrefs):
+            return list(self.models)
+        accum = []
+        seen = set()
+        for model in self.models:
+            if model in seen:
+                continue
+            seen.add(model)
+            accum.append(model)
+            for _, related, _ in model._meta.model_graph(
+                    refs=self.bind_refs, backrefs=self.bind_backrefs):
+                if related not in seen:
+                    seen.add(related)
+                    accum.append(related)
+        return accum
+
+    def __enter__(self):
+        self._mapping = dict((model, self.database)
+                             for model in self._collect_models())
+        _context_bound_dbs.push(self._mapping)
+        return self.models
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        _context_bound_dbs.pop()
+
+
 class Proxy(object):
     __slots__ = ('obj', '_callbacks')
 
@@ -755,7 +831,9 @@ def query_to_string(query):
     # NOTE: this function is not exported by default as it might be misused --
     # and this misuse could lead to sql injection vulnerabilities. This
     # function is intended for debugging or logging purposes ONLY.
-    db = getattr(query, '_database', None)
+    resolver = getattr(query, '_get_database', None)
+    db = resolver() if resolver is not None else getattr(query, '_database',
+                                                          None)
     if db is not None:
         ctx = db.get_sql_context()
     else:
@@ -1195,7 +1273,7 @@ class CTE(_HashableSource, Source):
         else:
             query = (Select((self,), columns)
                      .with_cte(self)
-                     .bind(self._query._database))
+                     .bind(self._query._get_database()))
         return query
 
     def _get_hash(self):
@@ -2124,7 +2202,8 @@ class OnConflict(Node):
 def database_required(method):
     @wraps(method)
     def inner(self, database=None, *args, **kwargs):
-        database = self._database if database is None else database
+        if database is None:
+            database = self._get_database()
         if not database:
             raise InterfaceError('Query must be bound to a database in order '
                                  'to call "%s".' % method.__name__)
@@ -2138,6 +2217,11 @@ class BaseQuery(Node):
 
     def __init__(self, _database=None, **kwargs):
         self._database = _database
+        # Tracks whether ``_database`` was set via an explicit ``bind()``
+        # call. When False, ``_database`` is only a static default (copied
+        # from the model metadata at creation time) and yields to the
+        # context-local binding in effect at execution time.
+        self._explicit_database = _database is not None
         self._cursor_wrapper = None
         self._row_type = None
         self._constructor = None
@@ -2145,7 +2229,23 @@ class BaseQuery(Node):
 
     def bind(self, database=None):
         self._database = database
+        self._explicit_database = database is not None
         return self
+
+    def _get_database(self):
+        # Resolution order:
+        # 1. An explicit binding on the query itself (``query.bind(db)`` or a
+        #    ``database=`` argument to execute()) always wins.
+        # 2. Model queries fall back to the model's database, resolved at
+        #    execution time so that context-local bindings (``Model.use()``)
+        #    in effect when the query *runs* are honored, even if the query
+        #    was created outside the context.
+        if self._explicit_database:
+            return self._database
+        model = getattr(self, 'model', None)
+        if model is not None:
+            return model._meta.resolve_database()
+        return self._database
 
     def clone(self):
         query = super(BaseQuery, self).clone()
@@ -2187,8 +2287,9 @@ class BaseQuery(Node):
         raise NotImplementedError
 
     def sql(self):
-        if self._database:
-            context = self._database.get_sql_context()
+        database = self._get_database()
+        if database:
+            context = database.get_sql_context()
         else:
             context = Context()
         return context.parse(self)
@@ -2198,7 +2299,8 @@ class BaseQuery(Node):
         return self._execute(database)
 
     async def aexecute(self, database=None):
-        database = self._database if database is None else database
+        if database is None:
+            database = self._get_database()
         if not database:
             raise InterfaceError('Query must be bound to a database in order '
                                  'to call "aexecute".')
@@ -2215,7 +2317,7 @@ class BaseQuery(Node):
 
     def _ensure_execution(self):
         if self._cursor_wrapper is None:
-            if not self._database:
+            if not self._get_database():
                 raise ValueError('Query has not been executed.')
             self.execute()
 
@@ -2354,7 +2456,7 @@ class SelectQuery(Query):
             raise ValueError('select_from() must specify one or more columns.')
 
         query = (Select((self,), columns)
-                 .bind(self._database))
+                 .bind(self._get_database()))
         if getattr(self, 'model', None) is not None:
             # Bind to the sub-select's model type, if defined.
             query = query.objects(self.model)
@@ -2972,9 +3074,10 @@ class Insert(_WriteQuery):
         return ctx.sql(self._insert)
 
     def _default_values(self, ctx):
-        if not self._database:
+        database = self._get_database()
+        if not database:
             return ctx.literal('DEFAULT VALUES')
-        return self._database.default_values_insert(ctx)
+        return database.default_values_insert(ctx)
 
     @property
     def _query_type(self):
@@ -4134,6 +4237,18 @@ class Database(_callable_context_manager):
 
     def bind_ctx(self, models, bind_refs=True, bind_backrefs=True):
         return _BoundModelsContext(models, self, bind_refs, bind_backrefs)
+
+    def use(self, models, bind_refs=True, bind_backrefs=True):
+        """Return a context-manager that binds ``models`` to this database
+        for the duration of the block without rewriting model metadata.
+
+        The binding is local to the current thread and is consulted when
+        queries are *executed*, so queries created before entering the
+        context are still run against this database inside it. Nested
+        blocks restore the previous (possibly absent) binding on exit,
+        including when an exception is raised.
+        """
+        return _ModelUseContext(models, self, bind_refs, bind_backrefs)
 
     def get_noop_select(self, ctx):
         return ctx.literal('SELECT 0 WHERE 0')
@@ -7035,7 +7150,7 @@ class SchemaManager(object):
 
     @property
     def database(self):
-        db = self._database or self.model._meta.database
+        db = self._database or self.model._meta.resolve_database()
         if db is None:
             raise ImproperlyConfigured('database attribute does not appear to '
                                        'be set on the model: %s' % self.model)
@@ -7553,12 +7668,28 @@ class Metadata(object):
         del self.table
 
     def get_database_instance(self):
-        db = self.database
-        if db is None:
+        return self._unwrap_database(self.database)
+
+    def _unwrap_database(self, database):
+        if database is None:
             return
-        if isinstance(db, Proxy):
-            return db.obj if db.obj is not None else None
-        return db
+        if isinstance(database, Proxy):
+            return database.obj if database.obj is not None else None
+        return database
+
+    def resolve_database(self):
+        # Single entry-point for determining which database a model's
+        # queries, schema operations and transactions run against.
+        #
+        # Resolution order:
+        # 1. A context-local binding registered via ``Model.use()`` /
+        #    ``Database.use()`` in the current thread.
+        # 2. The database statically bound to the model's metadata (via
+        #    ``Meta.database``, ``Model.bind()`` or ``Model.bind_ctx()``).
+        database = _resolve_context_database(self.model)
+        if database is not None:
+            return self._unwrap_database(database)
+        return self.database
 
 
 class SubclassAwareMetadata(Metadata):
@@ -7842,7 +7973,7 @@ class Model(Node, metaclass=ModelBase):
             pk_name = cls._meta.primary_key.name
             field_names.remove(pk_name)
 
-        if cls._meta.database.returning_clause and \
+        if cls._meta.resolve_database().returning_clause and \
            cls._meta.primary_key is not False:
             pk_fields = cls._meta.get_primary_keys()
         else:
@@ -7952,7 +8083,7 @@ class Model(Node, metaclass=ModelBase):
             try:
                 if defaults:
                     kwargs.update(defaults)
-                with cls._meta.database.atomic():
+                with cls._meta.resolve_database().atomic():
                     return cls.create(**kwargs), True
             except IntegrityError as exc:
                 try:
@@ -8145,6 +8276,19 @@ class Model(Node, metaclass=ModelBase):
         return _BoundModelsContext((cls,), database, bind_refs, bind_backrefs)
 
     @classmethod
+    def use(cls, database, bind_refs=True, bind_backrefs=True):
+        """Return a context-manager that binds this model to ``database``
+        for the duration of the block without rewriting model metadata.
+
+        The binding is local to the current thread and is consulted when
+        queries are *executed*, so queries created before entering the
+        context are still run against ``database`` inside it. Nested blocks
+        restore the previous (possibly absent) binding on exit, including
+        when an exception is raised.
+        """
+        return _ModelUseContext((cls,), database, bind_refs, bind_backrefs)
+
+    @classmethod
     def table_exists(cls):
         M = cls._meta
         return cls._schema.database.table_exists(M.table.__name__, M.schema)
@@ -8298,8 +8442,13 @@ class _ModelQueryHelper(object):
 
     def __init__(self, *args, **kwargs):
         super(_ModelQueryHelper, self).__init__(*args, **kwargs)
-        if not self._database:
+        # Capture the model's statically-bound database as a default, but do
+        # not mark it as an explicit binding. Execution-time resolution via
+        # ``_get_database()`` then lets a context-local binding
+        # (``Model.use()``) override it, while ``query.bind(db)`` still wins.
+        if self._database is None:
             self._database = self.model._meta.database
+            self._explicit_database = False
 
     @Node.copy
     def objects(self, constructor=None):
@@ -8777,7 +8926,7 @@ class ModelSelect(BaseModelSelect, Select):
 
 class NoopModelSelect(ModelSelect):
     def __sql__(self, ctx):
-        return self.model._meta.database.get_noop_select(ctx)
+        return self.model._meta.resolve_database().get_noop_select(ctx)
 
     def _get_cursor_wrapper(self, cursor):
         return CursorWrapper(cursor)
@@ -8812,7 +8961,8 @@ class ModelInsert(_ModelWriteQueryHelper, Insert):
     def __init__(self, *args, **kwargs):
         super(ModelInsert, self).__init__(*args, **kwargs)
         if self._returning is None:
-            db = self.model._meta.get_database_instance()
+            db = self.model._meta._unwrap_database(
+                self.model._meta.resolve_database())
             if db is not None and db.returning_clause:
                 self._returning = self._pk_returning()
 

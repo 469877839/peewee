@@ -490,7 +490,7 @@ class AsyncDatabaseMixin(object):
 
 def _aio_database(model):
     # Ensure we have an asyncio-friendly db.
-    db = model._meta.database
+    db = model._meta.resolve_database()
     if isinstance(db, Proxy):
         db = db.obj
     if db is None:
