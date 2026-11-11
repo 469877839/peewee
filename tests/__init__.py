@@ -13,6 +13,8 @@ from . import db_tests
 MODULES.append(db_tests)
 from . import fields
 MODULES.append(fields)
+from . import join_assembly
+MODULES.append(join_assembly)
 from . import manytomany
 MODULES.append(manytomany)
 from . import models
