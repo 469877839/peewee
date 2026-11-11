@@ -131,6 +131,7 @@ __all__ = [
     'PostgresqlDatabase',
     'PrimaryKeyField',  # XXX: Deprecated, change to AutoField.
     'prefetch',
+    'prefetch_windowed',
     'PREFETCH_TYPE',
     'ProgrammingError',
     'Proxy',
@@ -150,6 +151,7 @@ __all__ = [
     'Value',
     'ValuesList',
     'Window',
+    'WindowedPrefetch',
 ]
 
 logger = logging.getLogger('peewee')
@@ -8396,6 +8398,9 @@ class BaseModelSelect(_ModelQueryHelper):
     def prefetch(self, *subqueries, **kwargs):
         return prefetch(self, *subqueries, **kwargs)
 
+    def prefetch_windowed(self, window_size, *loads, **kwargs):
+        return prefetch_windowed(self, window_size, *loads, **kwargs)
+
     @Node.copy
     def with_related(self, *loads):
         # Accept fk/backref references, wrap w/Load().
@@ -9605,3 +9610,121 @@ def _load_related(parents, parent_query, loads, depth=0, database=None):
         if node._children:
             _load_related(children, child_query, node._children, depth + 1,
                           database)
+
+
+def _materialize_loads(loads):
+    # Re-scope a Load tree to the parents held in memory: each window is
+    # already materialized, so relations filter on the window's keys with a
+    # literal IN-list rather than re-embedding the (unbounded) root query.
+    fixed = []
+    for load in loads:
+        clone = load.clone()
+        clone._strategy = PREFETCH_TYPE.MATERIALIZE
+        clone._children = tuple(_materialize_loads(load._children))
+        fixed.append(clone)
+    return fixed
+
+
+class WindowedPrefetch(object):
+    """Stream a root query in fixed-size windows of root rows.
+
+    Each window is fetched through the same relation-loading machinery as
+    :meth:`ModelSelect.with_related` (the :class:`Load` tree), so every root
+    yielded already has its relations attached. The root query is streamed via
+    a server-side cursor wrapper rather than materialized, and only the current
+    window (plus the rows related to it) is held in memory at once.
+
+    Relation queries are scoped per window (one query per relation per window,
+    filtered on the window's keys), so a child row that belongs to roots in two
+    windows is fetched twice and there is no promise of cross-window identity.
+    Use :meth:`close`, a ``with``-block or generator-iteration cleanup to
+    release the root cursor when consumption stops early.
+    """
+    def __init__(self, query, window_size, loads, database=None):
+        if not isinstance(window_size, int) or window_size < 1:
+            raise ValueError('window_size must be a positive integer.')
+        if not isinstance(query, BaseModelSelect) or not query._model_rows():
+            raise ValueError('prefetch_windowed() requires a model-select '
+                             'query returning model instances.')
+        if query._load_tree:
+            raise ValueError('with_related() loads are incompatible with '
+                             'prefetch_windowed(); pass the Load() nodes to '
+                             'prefetch_windowed() instead.')
+        self.query = query
+        self.window_size = window_size
+        self.loads = _materialize_loads(
+            tuple(l if isinstance(l, Load) else Load(l) for l in loads))
+        self.database = database
+        self._iterator = None
+
+    def __iter__(self):
+        if self._iterator is not None:
+            raise ValueError('A WindowedPrefetch may only be iterated once.')
+        self._iterator = self._run()
+        return self._iterator
+
+    def _run(self):
+        # Clone so the caller's query keeps no cursor state, and stream rows
+        # through iterator() so the cursor wrapper does not accumulate a
+        # row_cache: neither count() nor a full list is taken on the root.
+        root_query = self.query.clone()
+        database = self.database
+        wrapper = root_query.execute(database)
+        rows = wrapper.iterator()
+        try:
+            while True:
+                window = list(itertools.islice(rows, self.window_size))
+                if not window:
+                    break
+                if self.loads:
+                    _load_related(window, root_query, self.loads,
+                                  database=database)
+                yield window
+        finally:
+            # Both a natural exhaustion and an early break/close land here, so
+            # the root cursor is released without waiting for garbage
+            # collection.
+            if not wrapper.populated:
+                wrapper.cursor.close()
+                wrapper.populated = True
+
+    def close(self):
+        if self._iterator is not None:
+            self._iterator.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+
+def prefetch_windowed(sq, window_size, *loads, **kwargs):
+    """Eagerly load relations while streaming ``sq`` in root-row windows.
+
+    :param sq: A model select used as the root query. Its ``order_by`` defines
+        the order of the streamed roots and is never modified.
+    :param window_size: Number of root rows per window (a positive integer).
+    :param loads: One or more :class:`Load` nodes (or bare foreign-key /
+        back-reference fields, auto-wrapped in ``Load``), applied to each
+        window exactly as with :meth:`ModelSelect.with_related`. Any
+        ``WHERE``/``JOIN`` strategy is run as ``MATERIALIZE``: a relation
+        filters on the keys of the roots in the current window, never on the
+        full root query, so per-window work and memory stay bounded.
+    :param database: Optional database to run every query against; defaults to
+        the database the root query is bound to.
+    :return: A :class:`WindowedPrefetch` iterator that yields lists of at most
+        ``window_size`` root instances with their relations already attached.
+
+    Duplicate root rows (from a join-fanned root query) are delivered as
+    distinct instances in stream order, each hydrated independently. Empty
+    relations stay empty and forward foreign keys whose row is absent are left
+    unresolved rather than raising. Self-referential relations need no alias:
+    the relation never embeds the root query, so it cannot correlate with
+    itself. A child matching roots in two windows is loaded once per window,
+    so Python identity is not shared across windows.
+    """
+    database = kwargs.pop('database', None)
+    if kwargs:
+        raise ValueError('Unrecognized arguments: %s' % kwargs)
+    return WindowedPrefetch(sq, window_size, loads, database)

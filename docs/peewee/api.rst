@@ -2915,6 +2915,26 @@ Model
       See :class:`Load` for the per-relation options, and :ref:`relationships` for
       a fuller discussion of joins and prefetching.
 
+   .. method:: prefetch_windowed(window_size, *loads, database=None)
+
+      :param window_size: Number of root rows per window (a positive integer).
+      :param loads: One or more :class:`Load` nodes, or foreign-key /
+          back-reference fields (wrapped in a :class:`Load` implicitly).
+      :param database: Optional database to run every query against.
+      :return: a :class:`WindowedPrefetch` iterator of root-row windows.
+
+      Stream the query in windows of ``window_size`` root rows, loading the
+      given relations for each window before it is yielded. Same as calling
+      :func:`prefetch_windowed` with this query as the first argument. Unlike
+      :meth:`with_related`, the root query is never materialized in full, so
+      this suits iterating a large export with bounded memory.
+
+      .. code-block:: python
+
+         for window in User.select().prefetch_windowed(100, Load(User.tweets)):
+             for user in window:
+                 print(user.username, len(user.tweets))
+
 
 .. class:: DoesNotExist
 
@@ -6658,6 +6678,59 @@ Queries
    necessary to be sure that the foreign-key/primary-key of any
    related models are selected, so that the related objects can be
    mapped correctly.
+
+
+.. function:: prefetch_windowed(sq, window_size, *loads, database=None)
+
+   :param sq: A model select used as the root query. Its ``order_by``
+       determines the order of the streamed roots and is never modified.
+   :param window_size: Number of root rows per window (a positive integer).
+   :param loads: One or more :class:`Load` nodes, or foreign-key /
+       back-reference fields (wrapped in a :class:`Load` implicitly), applied
+       to each window exactly as with :meth:`ModelSelect.with_related`.
+   :param database: Optional database to run every query against; defaults to
+       the database the root query is bound to.
+   :return: A :class:`WindowedPrefetch` iterator that yields lists of at most
+       ``window_size`` root instances with their relations already attached.
+
+   Streaming variant of eager loading for large result sets. The root query is
+   read through a cursor rather than materialized: no ``COUNT`` and no full
+   ``list()`` is taken on it. For each window, each relation runs one query
+   filtered on the window's keys, so per-window work and memory stay bounded.
+   The ``WHERE``/``JOIN``/``MATERIALIZE`` distinction does not apply here --
+   every :class:`Load` runs as ``MATERIALIZE`` against the window, and the
+   supplied nodes are not modified.
+
+   .. code-block:: python
+
+      query = User.select().order_by(User.username)
+      for window in prefetch_windowed(query, 100, Load(User.tweets)):
+          for user in window:
+              print(user.username, len(user.tweets))
+
+   A root query fanned out by a join may contain the same row more than once:
+   each occurrence is yielded as a distinct, independently-hydrated instance.
+   A child row that matches roots in two windows is loaded once per window, so
+   cross-window Python identity is intentionally not guaranteed. Stopping
+   iteration early closes the root cursor; :class:`WindowedPrefetch` also
+   supports ``close()`` and the context-manager protocol.
+
+
+.. class:: WindowedPrefetch
+
+   Iterator returned by :func:`prefetch_windowed` and
+   :meth:`ModelSelect.prefetch_windowed`. It yields lists of root instances,
+   each of at most ``window_size`` rows, with the requested relations already
+   attached. It may only be iterated once.
+
+   .. method:: close()
+
+      Stop streaming and release the root cursor immediately, without waiting
+      for garbage collection. Safe to call after exhaustion.
+
+   The class supports the context-manager protocol, so an early ``break``
+   inside a ``with`` block still closes the root cursor.
+
 
 
 .. class:: Load(rel[, query=None[, strategy=PREFETCH_TYPE.WHERE[, per_parent=None]]])

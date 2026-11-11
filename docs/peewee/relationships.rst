@@ -984,6 +984,8 @@ for *k* tables. Peewee has two APIs for this:
 
 * :meth:`~ModelSelect.with_related` with :class:`Load` nodes: the declarative,
   nestable form, recommended for new code.
+* :func:`prefetch_windowed`: the streaming form, which delivers the root query
+  in fixed-size windows of fully-loaded rows (see :ref:`prefetch-windowed`).
 * :func:`prefetch`: the older flat-list form, kept for backwards compatibility.
 
 Eager loading with with_related
@@ -1148,6 +1150,52 @@ Examples:
 
    tweets = Load(User.tweets, strategy=PREFETCH_TYPE.MATERIALIZE)
    query = User.select().with_related(tweets)
+
+.. _prefetch-windowed:
+
+Windowed prefetch for large exports
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+:meth:`~ModelSelect.with_related` and :func:`prefetch` both materialize the
+whole result before returning, which does not suit exporting a large table:
+every root row and every related row would be held in memory at once.
+:func:`prefetch_windowed` streams the root query instead and yields the roots
+in fixed-size *windows*, each window already carrying its relations:
+
+.. code-block:: python
+
+   users = User.select().order_by(User.username)
+   for window in users.prefetch_windowed(100, Load(User.tweets)):
+       for user in window:  # Up to 100 users, tweets already attached.
+           export(user, user.tweets)
+
+The root query runs once, streamed through a cursor -- no ``COUNT`` and no
+full ``list()`` is taken on it. For each window, every relation runs one query
+scoped to that window's keys (the ``MATERIALIZE`` strategy, whatever strategy
+the :class:`Load` nodes name), so memory stays bounded by the window size
+rather than the export size. With ``window_size=100`` and one relation, the
+export above issues ``1 + ceil(n / 100)`` queries for ``n`` users.
+
+Semantics worth knowing:
+
+* The root query's ``order_by`` is preserved; windows arrive in stream order.
+* A root query fanned out by a join may yield the same row twice; each
+  duplicate is a distinct instance, hydrated independently.
+* A child row belonging to roots in two windows is fetched once per window, so
+  Python identity is *not* shared across windows.
+* Empty relations are empty lists, and self-referential relations need no
+  alias (the relation never embeds the root query, so it cannot correlate
+  with itself).
+
+Consumption can stop at any time. The root cursor is closed when the iterator
+is exhausted, garbage-collected, or explicitly closed:
+
+.. code-block:: python
+
+   with User.select().prefetch_windowed(100, Load(User.tweets)) as windows:
+       for window in windows:
+           if should_stop(window):
+               break  # Root cursor is closed on leaving the block.
 
 .. _json-relations:
 

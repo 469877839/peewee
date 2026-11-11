@@ -7,6 +7,15 @@ https://github.com/coleifer/peewee/releases
 
 ## master
 
+* Add `prefetch_windowed()` (also `ModelSelect.prefetch_windowed()`), a
+  streaming eager-loading API that yields the root query in fixed-size
+  windows of fully-loaded rows. The root query is streamed through a cursor
+  (no `COUNT`, no full `list()`), each relation runs one query per window
+  filtered on that window's keys, and the root cursor is closed on
+  exhaustion, `close()`, context-manager exit, or garbage collection. Suited
+  to exporting large tables with bounded memory. See
+  [docs](https://docs.peewee-orm.com/en/latest/peewee/relationships.html#windowed-prefetch-for-large-exports).
+
 [View commits](https://github.com/coleifer/peewee/compare/4.5.3...master)
 
 ## 4.5.3

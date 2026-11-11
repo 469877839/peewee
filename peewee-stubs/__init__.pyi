@@ -2006,6 +2006,12 @@ class BaseModelSelect(_ModelQueryHelper):
     __sub__ = except_
     def __iter__(self): ...
     def prefetch(self, *subqueries, prefetch_type: int = ...): ...
+    def prefetch_windowed(
+        self,
+        window_size: int,
+        *loads: Load | ForeignKeyField[Any] | BackrefAccessor,
+        database: _DatabaseType | None = ...,
+    ) -> WindowedPrefetch: ...
     def with_related(
         self, *loads: Load | ForeignKeyField[Any] | BackrefAccessor
     ) -> Self: ...
@@ -2125,6 +2131,30 @@ class PrefetchQuery(_PrefetchQuery):
 
 def prefetch(sq, *subqueries, prefetch_type: int = ...): ...
 
+def prefetch_windowed(
+    sq: BaseModelSelect,
+    window_size: int,
+    *loads: Load | ForeignKeyField[Any] | BackrefAccessor,
+    database: _DatabaseType | None = ...,
+) -> WindowedPrefetch: ...
+
+class WindowedPrefetch:
+    query: BaseModelSelect
+    window_size: int
+    loads: tuple[Load, ...]
+    database: _DatabaseType | None
+    def __init__(
+        self,
+        query: BaseModelSelect,
+        window_size: int,
+        loads: tuple[Load | ForeignKeyField[Any] | BackrefAccessor, ...],
+        database: _DatabaseType | None = ...,
+    ) -> None: ...
+    def __iter__(self) -> Iterator[list[Any]]: ...
+    def close(self) -> None: ...
+    def __enter__(self) -> WindowedPrefetch: ...
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None: ...
+
 class Load(Node):
     def __init__(
         self,
@@ -2199,6 +2229,7 @@ __all__ = [
     "PostgresqlDatabase",
     "PrimaryKeyField",
     "prefetch",
+    "prefetch_windowed",
     "PREFETCH_TYPE",
     "ProgrammingError",
     "Proxy",
@@ -2218,4 +2249,5 @@ __all__ = [
     "Value",
     "ValuesList",
     "Window",
+    "WindowedPrefetch",
 ]
