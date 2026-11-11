@@ -1282,6 +1282,62 @@ relationships. Peewee has limited support for foreign keys *to* models with
 composite primary keys, so avoid them in models that other models will
 reference.
 
+.. _composite-foreign-keys:
+
+Composite foreign keys
+^^^^^^^^^^^^^^^^^^^^^^
+
+A regular :class:`ForeignKeyField` maps one column to one column. When records
+are identified by several columns together -- for example an ingestion library
+keyed by ``(source_id, external_id)``, where two sources may reuse the same
+``external_id`` -- use :class:`CompositeForeignKeyField`. It declares **one**
+relation over an ordered list of ``(local, remote)`` column pairs, pointing at
+a composite primary key or a ``UNIQUE`` index on the related model. Two
+independent ``ForeignKeyField`` columns are not a substitute: joining on one
+of them would silently mix rows from different sources.
+
+.. code-block:: python
+
+   class Source(Model):
+       name = CharField(unique=True)
+
+   class Record(Model):
+       source = ForeignKeyField(Source)
+       external_id = CharField()
+       class Meta:
+           indexes = ((('source', 'external_id'), True),)  # candidate key
+
+   class Item(Model):
+       source = ForeignKeyField(Source)
+       external_id = CharField()
+       # Each pair follows the order (column on this model, column on Record).
+       record = CompositeForeignKeyField(
+           Record,
+           (('source', 'source'), ('external_id', 'external_id')),
+           backref='items')
+
+The field does not add a column of its own: the listed local columns must
+already exist on the model, and a single multi-column ``FOREIGN KEY``
+constraint is emitted when the table is created. Assignment, lazy loading,
+back-references, joins (including aliased models), ``prefetch()`` and
+``with_related()`` all treat the columns as a unit:
+
+.. code-block:: python
+
+   item = Item(source=source, external_id='abc')
+   item.record = record            # assign a related instance
+   item.record = (source_id, 'abc')  # or a tuple of key values, in order
+
+   Item.select(Item, Record).join(Record, on=Item.record)
+   prefetch(Item.select(), Record)
+   Record.select().with_related(Load(Record.items))
+
+NULL is a property of the whole relation. Pass ``null=True`` to allow an
+all-NULL key, and assign ``(None, None)`` (or ``None``); partially-NULL values
+are rejected with an explicit error, since they could never match a parent.
+Unsupported combinations raise at construction or query compile time rather
+than generating incorrect SQL.
+
 Models without a primary key
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -1328,6 +1384,10 @@ the person's first and last name. You wish to have another table relate to the
        class Meta:
            constraints = [SQL('FOREIGN KEY(owner_first, owner_last) '
                               'REFERENCES person(first, last)')]
+
+For a full relation (lazy loading, joins, prefetching) against a composite
+key, use :class:`CompositeForeignKeyField` instead of a raw SQL constraint --
+see :ref:`composite-foreign-keys`.
 
 ``CHECK`` constraints can be specified at the table level:
 

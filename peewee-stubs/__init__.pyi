@@ -1732,6 +1732,40 @@ class CompositeKey(MetaField):
     column_name: Incomplete
     def bind(self, model, name, set_attribute: bool = True) -> None: ...
 
+class CompositeForeignKeyField(MetaField):
+    deferred: bool
+    rel_model: Incomplete
+    local_fields: list[Field[Any]]
+    rel_fields: list[Field[Any]]
+    backref: Incomplete
+    on_delete: Incomplete
+    on_update: Incomplete
+    deferrable: Incomplete
+    lazy_load: bool
+    constraint_name: str | None
+    null: bool
+    def __init__(
+        self,
+        model: type[Model] | Literal["self"],
+        field: Iterable[tuple[str | Field[Any], str | Field[Any]]],
+        backref: str | Callable[..., str] | None = ...,
+        on_delete: str | None = ...,
+        on_update: str | None = ...,
+        deferrable: str | None = ...,
+        null: bool = ...,
+        lazy_load: bool = ...,
+        constraint_name: str | None = ...,
+    ) -> None: ...
+    def get_fields(self) -> list[Field[Any]]: ...
+    def get_constraint_name(self) -> str: ...
+    def foreign_key_constraint(self, explicit_name: bool = ...): ...
+    def __eq__(self, other) -> Expression | bool: ...  # type: ignore[override]
+    def __ne__(self, other) -> Expression | bool: ...  # type: ignore[override]
+    def __lshift__(self, rhs) -> Expression: ...
+    def __hash__(self) -> int: ...
+    def __sql__(self, ctx): ...
+    def bind(self, model, name, set_attribute: bool = True) -> None: ...
+
 class _SortedFieldList:
     __slots__ = ("_keys", "_items")
     def __init__(self) -> None: ...

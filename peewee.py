@@ -87,6 +87,7 @@ __all__ = [
     'Check',
     'chunked',
     'Column',
+    'CompositeForeignKeyField',
     'CompositeKey',
     'Context',
     'Database',
@@ -6989,6 +6990,439 @@ class CompositeKey(MetaField):
             setattr(model, self.name, self)
 
 
+class _CompositeValueList(Node):
+    # Renders a list of row-values for IN, e.g. ((?, ?), (?, ?)). SQLite,
+    # postgres and mysql all accept row-value IN; binding a tuple as a single
+    # parameter would be interpreted as one value and silently mis-compare.
+    def __init__(self, values):
+        self.values = values
+
+    def __sql__(self, ctx):
+        rows = [EnclosedNodeList([Value(v, unpack=False) for v in row])
+                for row in self.values]
+        return ctx.sql(EnclosedNodeList(rows))
+
+
+class CompositeForeignKeyAccessor(object):
+    def __init__(self, model, field, name):
+        self.model = model
+        self.field = field
+        self.name = name
+
+    def _to_values(self, value):
+        field = self.field
+        if isinstance(value, field.rel_model):
+            # Read the raw column values rather than the descriptors, so a
+            # single-column foreign-key that is part of the candidate key
+            # does not trigger a lazy load.
+            values = tuple(value.__data__.get(f.name)
+                           for f in field.rel_fields)
+        elif isinstance(value, (list, tuple)):
+            values = tuple(value)
+        elif value is None:
+            values = (None,) * len(field.local_fields)
+        else:
+            raise TypeError(
+                'Composite foreign-key "%s" requires a %s instance, a tuple '
+                'of %d values, or None. Got: %r.' %
+                (self.name, field.rel_model.__name__,
+                 len(field.local_fields), value))
+        if len(values) != len(field.local_fields):
+            raise ValueError(
+                'Composite foreign-key "%s" expects %d values, got %d.' %
+                (self.name, len(field.local_fields), len(values)))
+        return values
+
+    def _check_nulls(self, values):
+        is_null = [v is None for v in values]
+        if any(is_null) and not all(is_null):
+            raise ValueError(
+                'Composite foreign-key "%s" received a partially-NULL value '
+                '%r. Every column must be NULL, or none may be NULL.' %
+                (self.name, values))
+        if all(is_null) and not self.field.null:
+            raise ValueError(
+                'Composite foreign-key "%s" is declared NOT NULL, so it '
+                'cannot be set to an all-NULL value.' % self.name)
+
+    def __get__(self, instance, instance_type=None):
+        if instance is None:
+            return self.field
+        return self.get_rel_instance(instance)
+
+    def __set__(self, instance, value):
+        field = self.field
+        values = self._to_values(value)
+        self._check_nulls(values)
+        for local, item in zip(field.local_fields, values):
+            instance.__data__[local.name] = item
+        instance._dirty.update(local.name for local in field.local_fields)
+        if isinstance(value, field.rel_model):
+            instance.__rel__[self.name] = value
+        else:
+            # A bare tuple (or None) only carries the key columns; any cached
+            # related instance is stale unless its key matches exactly.
+            cached = instance.__rel__.get(self.name)
+            if cached is None or field._key(cached) != values:
+                instance.__rel__.pop(self.name, None)
+
+    def get_rel_instance(self, instance):
+        field = self.field
+        if self.name in instance.__rel__:
+            return instance.__rel__[self.name]
+        values = tuple(instance.__data__.get(local.name)
+                       for local in field.local_fields)
+        nulls = [v is None for v in values]
+        if any(nulls) and not all(nulls):
+            raise ValueError(
+                'Composite foreign-key "%s" on %s is partially NULL (%r) '
+                'and cannot be resolved.' % (self.name, instance, values))
+        if all(nulls):
+            if field.null:
+                return None
+            if field.lazy_load:
+                raise field.rel_model.DoesNotExist(
+                    'Composite foreign-key "%s" has no value to resolve.' %
+                    self.name)
+            return None
+        if not field.lazy_load:
+            return None
+        obj = field.rel_model.get(field._rel_equality(values))
+        instance.__rel__[self.name] = obj
+        return obj
+
+
+class CompositeBackrefAccessor(object):
+    def __init__(self, field):
+        self.field = field
+        self.model = field.rel_model
+        self.rel_model = field.model
+
+    def __get__(self, instance, instance_type=None):
+        if instance is not None:
+            field = self.field
+            values = tuple(instance.__data__.get(f.name)
+                           for f in field.rel_fields)
+            return self.rel_model.select().where(field._equality(values))
+        return self
+
+
+class CompositeForeignKeyField(MetaField):
+    """A single relation between several local columns and a composite
+    candidate key on another model, e.g. ``(source_id, external_id)``.
+
+    The column correspondence is declared as an ordered list of
+    ``(local, remote)`` pairs; a bare name means the same column on both
+    sides::
+
+        class Item(Model):
+            source = ForeignKeyField(Source)
+            external_id = CharField()
+            record = CompositeForeignKeyField(
+                Record, (('source', 'source'), ('external_id', 'external_id')),
+                backref='items')
+
+    Unlike two independent :class:`ForeignKeyField`\\s, this is one relation:
+    joins, back-refs, lazy loading, assignment and prefetching treat the
+    columns as a unit.
+    """
+
+    accessor_class = CompositeForeignKeyAccessor
+    backref_accessor_class = CompositeBackrefAccessor
+    deferred = False
+
+    def __init__(self, model, field, backref=None, on_delete=None,
+                 on_update=None, deferrable=None, null=False,
+                 lazy_load=True, constraint_name=None, *args, **kwargs):
+        if not isinstance(model, str) and not is_model(model):
+            raise TypeError('CompositeForeignKeyField requires a model '
+                            'class, got %r.' % (model,))
+        if field is None:
+            raise ValueError('CompositeForeignKeyField requires at least two '
+                             '(local, remote) column pairs.')
+        self._is_self_reference = isinstance(model, str) and model == 'self'
+        self.rel_model = model
+        self.declared_backref = backref
+        self.backref = None
+        self.on_delete = on_delete
+        self.on_update = on_update
+        self.deferrable = deferrable
+        self.lazy_load = lazy_load
+        self.constraint_name = constraint_name
+        self.local_fields = []
+        self.rel_fields = []
+        self._pairs = self._normalize_pairs(field)
+        # NULL is a property of the relation as a whole, not of one column.
+        super(CompositeForeignKeyField, self).__init__(null=null, *args,
+                                                       **kwargs)
+
+    @staticmethod
+    def _pair_name(pair):
+        if isinstance(pair, str):
+            return pair
+        return pair.name
+
+    def _normalize_pairs(self, field):
+        if not isinstance(field, (list, tuple)):
+            raise ValueError('CompositeForeignKeyField expects an iterable '
+                             'of (local, remote) column pairs. Got: %r.' %
+                             (field,))
+        pairs = []
+        for pair in field:
+            if isinstance(pair, str):
+                pairs.append((pair, pair))
+            elif isinstance(pair, (list, tuple)) and len(pair) == 2:
+                pairs.append((self._pair_name(pair[0]),
+                              self._pair_name(pair[1])))
+            else:
+                raise ValueError('CompositeForeignKeyField expects '
+                                 '(local, remote) column pairs, got: %r.'
+                                 % (pair,))
+        if len(pairs) < 2:
+            raise ValueError('CompositeForeignKeyField requires at least two '
+                             'column pairs; use ForeignKeyField for a single '
+                             'column.')
+        local_names = [local for local, remote in pairs]
+        if len(set(local_names)) != len(local_names):
+            raise ValueError('Duplicate local columns in composite foreign-'
+                             'key pairs: %s.' % local_names)
+        return pairs
+
+    def _resolve(self, model, names, side):
+        values = []
+        for name in names:
+            try:
+                value = getattr(model, name)
+            except AttributeError:
+                raise ValueError('CompositeForeignKeyField %s column %r is '
+                                 'not defined on %s.' %
+                                 (side, name, model._meta.name))
+            if isinstance(value, FieldAlias):
+                value = value.field
+            if not isinstance(value, Field):
+                raise ValueError('CompositeForeignKeyField %s column %r on '
+                                 '%s does not resolve to a model field.' %
+                                 (side, name, model._meta.name))
+            values.append(value)
+        return values
+
+    def bind(self, model, name, set_attribute=True):
+        if self._is_self_reference:
+            self.rel_model = model
+        local = self._resolve(model, [p[0] for p in self._pairs], 'local')
+        rel = self._resolve(self.rel_model, [p[1] for p in self._pairs],
+                            'remote')
+        existing_composites = [
+            ref for ref in model._meta.refs
+            if isinstance(ref, CompositeForeignKeyField)]
+        for field in local:
+            if any(field in other.local_fields
+                   for other in existing_composites):
+                raise ValueError(
+                    'CompositeForeignKeyField "%s".%s cannot reuse column %r: '
+                    'each column must belong to exactly one composite '
+                    'relation.' % (model._meta.name, name, field.name))
+            if field is self.rel_model._meta.primary_key:
+                raise ValueError('CompositeForeignKeyField "%s".%s references '
+                                 'the related model\'s primary key %r as a '
+                                 'local column.' %
+                                 (model._meta.name, name, field.name))
+        if len(set(field.name for field in local)) != len(local):
+            raise ValueError('CompositeForeignKeyField "%s".%s repeats a '
+                             'local column.' % (model._meta.name, name))
+        self.local_fields = local
+        self.rel_fields = rel
+        self._validate_candidate_key(model, name)
+        self.model = model
+        self.name = self.safe_name = name
+        self.column_name = name
+        if callable(self.declared_backref):
+            self.backref = self.declared_backref(self)
+        else:
+            self.backref, self.declared_backref = self.declared_backref, None
+        if not self.backref:
+            self.backref = '%s_set' % model._meta.name
+        if set_attribute:
+            setattr(model, name, self.accessor_class(model, self, name))
+            if self.backref not in ('+', '!'):
+                setattr(self.rel_model, self.backref,
+                        self.backref_accessor_class(self))
+
+    def _validate_candidate_key(self, model, name):
+        meta = self.rel_model._meta
+        rel_names = [field.name for field in self.rel_fields]
+        if meta.composite_key and isinstance(meta.primary_key, CompositeKey):
+            pk_names = list(meta.primary_key.field_names)
+            if rel_names == pk_names:
+                return
+        # A unique index (or unique constraint) over the same set of columns
+        # is a candidate key too. Column order does not have to match the
+        # index definition; the declared pair order is what the FK uses.
+        rel_set = set(rel_names)
+        for index in meta.fields_to_index():
+            if not (isinstance(index, ModelIndex) and index._unique):
+                continue
+            if index._where is not None:
+                # A partial unique index is not a candidate key.
+                continue
+            expressions = index._expressions
+            index_fields = []
+            for expression in expressions:
+                if isinstance(expression, Node):
+                    expression = expression.unwrap()
+                if not isinstance(expression, Field):
+                    break
+                index_fields.append(expression)
+            else:
+                if set(f.name for f in index_fields) == rel_set:
+                    return
+        raise ValueError(
+            'CompositeForeignKeyField "%s".%s points at %s columns %r, '
+            'which are not a composite primary key or a UNIQUE key. Add a '
+            'unique index or use a composite primary key on %s.' %
+            (model._meta.name, name, self.rel_model.__name__, rel_names,
+             self.rel_model.__name__))
+
+    def get_fields(self):
+        return self.local_fields
+
+    def get_constraint_name(self):
+        return self.constraint_name or 'fk_%s_%s_refs_%s' % (
+            self.model._meta.table_name,
+            self.name,
+            self.rel_model._meta.table_name)
+
+    def foreign_key_constraint(self, explicit_name=False):
+        parts = []
+        if self.constraint_name or explicit_name:
+            parts.extend([
+                SQL('CONSTRAINT'),
+                Entity(_truncate_constraint_name(self.get_constraint_name()))])
+        parts.extend([
+            SQL('FOREIGN KEY'),
+            EnclosedNodeList(self.local_fields),
+            SQL('REFERENCES'),
+            self.rel_model,
+            EnclosedNodeList(self.rel_fields)])
+        if self.on_delete:
+            parts.append(SQL('ON DELETE %s' % self.on_delete))
+        if self.on_update:
+            parts.append(SQL('ON UPDATE %s' % self.on_update))
+        if self.deferrable:
+            parts.append(SQL('DEFERRABLE %s' % self.deferrable))
+        return NodeList(parts)
+
+    def _key(self, obj):
+        return tuple(obj.__data__.get(field.name)
+                     for field in self.rel_fields)
+
+    def _rel_equality(self, values):
+        # Compare against the related model's candidate-key columns; used
+        # when the query is rooted at the related model (lazy loading).
+        if len(values) != len(self.rel_fields):
+            raise ValueError('Composite foreign-key "%s" expects %d values, '
+                             'got %d.' % (self.name, len(self.rel_fields),
+                                          len(values)))
+        is_null = [value is None for value in values]
+        if any(is_null) and not all(is_null):
+            raise ValueError('Composite foreign-key "%s" received a '
+                             'partially-NULL value %r.' % (self.name, values))
+        if all(is_null):
+            return reduce(operator.and_,
+                          [field.is_null() for field in self.rel_fields])
+        return reduce(operator.and_, [field == value
+                                      for field, value in zip(self.rel_fields,
+                                                              values)])
+
+    def _equality(self, values):
+        if len(values) != len(self.local_fields):
+            raise ValueError('Composite foreign-key "%s" expects %d values, '
+                             'got %d.' % (self.name, len(self.local_fields),
+                                          len(values)))
+        model = self.model
+        if model is None:
+            raise ValueError('Composite foreign-key "%s" is not bound to a '
+                             'model.' % self.name)
+        local = [getattr(model, field.name) for field in self.local_fields]
+        is_null = [value is None for value in values]
+        if any(is_null) and not all(is_null):
+            raise ValueError('Composite foreign-key "%s" received a '
+                             'partially-NULL value %r.' % (self.name, values))
+        if all(is_null):
+            return reduce(operator.and_, [field.is_null() for field in local])
+        return reduce(operator.and_, [field == value
+                                      for field, value in zip(local, values)])
+
+    def _in_values(self, values):
+        if isinstance(values, (list, tuple)):
+            rows = []
+            for value in values:
+                row = tuple(value)
+                if len(row) != len(self.local_fields):
+                    raise ValueError(
+                        'Composite foreign-key "%s" IN values must have %d '
+                        'columns, got %d: %r.' %
+                        (self.name, len(self.local_fields), len(row), row))
+                rows.append(row)
+            if not rows:
+                # An empty EnclosedNodeList makes the IN render as 0 = 1.
+                return EnclosedNodeList(())
+            return _CompositeValueList(rows)
+        if isinstance(values, SelectBase):
+            # The subquery must project exactly the key columns; otherwise
+            # the row-value comparison would be silently invalid.
+            selected = values._returning
+            if (selected is not None and
+                    len(selected) != len(self.local_fields)):
+                raise ValueError(
+                    'Composite foreign-key "%s" IN subquery must select %d '
+                    'columns, got %d.' %
+                    (self.name, len(self.local_fields), len(selected)))
+            return values
+        raise TypeError('Composite foreign-key "%s" IN clause expects a list '
+                        'of row tuples or a subquery, got: %r.' %
+                        (self.name, values))
+
+    def __eq__(self, other):
+        if other is None:
+            return self._equality((None,) * len(self.local_fields))
+        if isinstance(other, (list, tuple)):
+            return self._equality(other)
+        raise ValueError('Composite foreign-key "%s" can only be compared '
+                         'with a tuple of %d values or NULL.' %
+                         (self.name, len(self.local_fields)))
+
+    def __ne__(self, other):
+        return ~(self == other)
+
+    def __lshift__(self, rhs):
+        model = self.model
+        if model is self.rel_model:
+            # The query is rooted at the related model (e.g. prefetch
+            # subqueries); the candidate-key columns form the row value.
+            lhs = NodeList(self.rel_fields, ', ', True)
+        else:
+            lhs = self
+        return Expression(lhs, OP.IN, self._in_values(rhs))
+
+    in_ = __lshift__
+
+    def __hash__(self):
+        return hash((self.__class__.__name__, self.model, self.name))
+
+    def __sql__(self, ctx):
+        parens = ctx.scope != SCOPE_SOURCE
+        model = self.model
+        local = [getattr(model, field.name) for field in self.local_fields]
+        return ctx.sql(NodeList(local, ', ', parens))
+
+    def __repr__(self):
+        if self.model is not None:
+            return '<%s: %s.%s>' % (type(self).__name__,
+                                    self.model.__name__, self.name)
+        return '<%s: (unbound)>' % type(self).__name__
+
+
 class _SortedFieldList(object):
     __slots__ = ('_keys', '_items')
 
@@ -7068,6 +7502,10 @@ class SchemaManager(object):
         for field in meta.sorted_fields:
             columns.append(field.ddl(ctx))
             if isinstance(field, ForeignKeyField) and not field.deferred:
+                constraints.append(field.foreign_key_constraint())
+
+        for field in meta.refs:
+            if isinstance(field, CompositeForeignKeyField):
                 constraints.append(field.foreign_key_constraint())
 
         if meta.constraints:
@@ -7458,7 +7896,7 @@ class Metadata(object):
         else:
             field.bind(self.model, field_name, set_attribute)
 
-        if isinstance(field, ForeignKeyField):
+        if isinstance(field, (ForeignKeyField, CompositeForeignKeyField)):
             self.add_ref(field)
         elif isinstance(field, ManyToManyField) and field.name:
             self.add_manytomany(field)
@@ -7484,7 +7922,8 @@ class Metadata(object):
             else:
                 del self._default_by_name[field_name]
 
-        if isinstance(original, ForeignKeyField):
+        if isinstance(original, (ForeignKeyField,
+                                 CompositeForeignKeyField)):
             self.remove_ref(original)
 
     def set_primary_key(self, name, field):
@@ -7779,13 +8218,28 @@ class Model(Node, metaclass=ModelBase):
                         raise ValueError('Unrecognized field name: "%s" in %s.'
                                          % (key, data))
                     field = key
+                if isinstance(field, CompositeForeignKeyField):
+                    raise ValueError(
+                        'Cannot use composite foreign-key "%s" as a column '
+                        'in insert/update; assign the individual columns (%s) '
+                        'instead.' %
+                        (field.name,
+                         ', '.join(f.name for f in field.local_fields)))
                 normalized[field] = data[key]
         if kwargs:
             for key in kwargs:
                 try:
                     normalized[cls._meta.combined[key]] = kwargs[key]
                 except KeyError:
-                    normalized[getattr(cls, key)] = kwargs[key]
+                    field = getattr(cls, key)
+                    if isinstance(field, CompositeForeignKeyField):
+                        raise ValueError(
+                            'Cannot use composite foreign-key "%s" as a '
+                            'column in insert/update; assign the individual '
+                            'columns (%s) instead.' %
+                            (key, ', '.join(f.name for f in
+                                            field.local_fields)))
+                    normalized[field] = kwargs[key]
         return normalized
 
     @classmethod
@@ -8067,12 +8521,20 @@ class Model(Node, metaclass=ModelBase):
                 continue
             seen.add(klass)
             for fk, rel_model in klass._meta.backrefs.items():
-                if rel_model is model_class or query is None:
-                    node = (fk == self.__data__[fk.rel_field.name])
+                if isinstance(fk, CompositeForeignKeyField):
+                    if rel_model is model_class or query is None:
+                        node = fk == tuple(self.__data__[rf.name]
+                                           for rf in fk.rel_fields)
+                    else:
+                        node = fk << query
+                    subquery = rel_model.select(*fk.local_fields).where(node)
                 else:
-                    node = fk << query
-                subquery = (rel_model.select(rel_model._meta.primary_key)
-                            .where(node))
+                    if rel_model is model_class or query is None:
+                        node = (fk == self.__data__[fk.rel_field.name])
+                    else:
+                        node = fk << query
+                    subquery = (rel_model.select(rel_model._meta.primary_key)
+                                .where(node))
                 if not fk.null or search_nullable:
                     queries.setdefault(rel_model, []).append((node, fk))
                     # A nullable child is updated, not deleted, so skip its
@@ -8089,7 +8551,11 @@ class Model(Node, metaclass=ModelBase):
             for query, fk in self.dependencies(exclude_null_children=not delete_nullable):
                 model = fk.model
                 if fk.null and not delete_nullable:
-                    model.update(**{fk.name: None}).where(query).execute()
+                    if isinstance(fk, CompositeForeignKeyField):
+                        values = {lf.name: None for lf in fk.local_fields}
+                    else:
+                        values = {fk.name: None}
+                    model.update(**values).where(query).execute()
                 else:
                     model.delete().where(query).execute()
         return type(self).delete().where(self._pk_expr()).execute()
@@ -8207,6 +8673,9 @@ class ModelAlias(Node):
                 continue
 
         model_attr = getattr(self.model, attr)
+        if isinstance(model_attr, CompositeForeignKeyField):
+            self.__dict__[attr] = CompositeFieldAlias.create(self, model_attr)
+            return self.__dict__[attr]
         if isinstance(model_attr, Field):
             self.__dict__[attr] = FieldAlias.create(self, model_attr)
             return self.__dict__[attr]
@@ -8268,6 +8737,51 @@ class FieldAlias(Field):
 
     def __sql__(self, ctx):
         return ctx.sql(Column(self.source, self.field.column_name))
+
+
+class CompositeFieldAlias(FieldAlias):
+    @classmethod
+    def create(cls, source, field):
+        class _CompositeFieldAlias(cls, type(field)):
+            pass
+        return _CompositeFieldAlias(source, field)
+
+    def get_fields(self):
+        return tuple(FieldAlias.create(self.source, field)
+                     for field in self.field.get_fields())
+
+    def _row(self):
+        return NodeList(self.get_fields(), ', ', True)
+
+    def _equality(self, other):
+        if other is None:
+            other = (None,) * len(self.field.local_fields)
+        elif not isinstance(other, (list, tuple)):
+            raise ValueError('Composite foreign-key "%s" can only be '
+                             'compared with a tuple of %d values or NULL.' %
+                             (self.field.name, len(self.field.local_fields)))
+        if len(other) != len(self.field.local_fields):
+            raise ValueError('Composite foreign-key "%s" expects %d values, '
+                             'got %d.' % (self.field.name,
+                                          len(self.field.local_fields),
+                                          len(other)))
+        return reduce(operator.and_, [field == value
+                                      for field, value in zip(
+                                              self.get_fields(), other)])
+
+    def __eq__(self, other):
+        return self._equality(other)
+
+    def __ne__(self, other):
+        return ~(self == other)
+
+    def __lshift__(self, rhs):
+        return Expression(self._row(), OP.IN, self.field._in_values(rhs))
+
+    in_ = __lshift__
+
+    def __hash__(self):
+        return hash((self.__class__.__name__, self.source, self.field.name))
 
 
 def sort_models(models):
@@ -8510,6 +9024,12 @@ class ModelSelect(BaseModelSelect, Select):
     def _normalize_join(self, src, dest, on, attr):
         # Allow "on" expression to have an alias that determines the
         # destination attribute for the joined data.
+        if isinstance(on, (BackrefAccessor, CompositeBackrefAccessor)):
+            raise ValueError('Cannot use the back-reference "%s" as a join '
+                             'condition. Join the model directly with '
+                             '.join(%s); the on clause is derived from the '
+                             'foreign-key automatically.' %
+                             (on.field.backref, on.rel_model.__name__))
         on_alias = isinstance(on, Alias)
         if on_alias:
             attr = attr or on._alias
@@ -8536,7 +9056,7 @@ class ModelSelect(BaseModelSelect, Select):
                                          'belong to %s or %s.' %
                                          (on, src_model, dest_model))
                 on = None
-            elif isinstance(on, Field):
+            elif isinstance(on, (Field, CompositeForeignKeyField)):
                 to_field = on
                 on = None
             else:
@@ -8546,15 +9066,32 @@ class ModelSelect(BaseModelSelect, Select):
                 src_model, dest_model, to_field, on)
 
             if on is None:
-                src_attr = 'name' if src_is_model else 'column_name'
-                dest_attr = 'name' if dest_is_model else 'column_name'
-                if is_backref:
-                    lhs = getattr(dest, getattr(fk_field, dest_attr))
-                    rhs = getattr(src, getattr(fk_field.rel_field, src_attr))
+                if isinstance(fk_field, CompositeForeignKeyField):
+                    src_attr = 'name' if src_is_model else 'column_name'
+                    dest_attr = 'name' if dest_is_model else 'column_name'
+                    exprs = []
+                    for local, remote in zip(fk_field.local_fields,
+                                             fk_field.rel_fields):
+                        if is_backref:
+                            lhs = getattr(dest, getattr(local, dest_attr))
+                            rhs = getattr(src, getattr(remote, src_attr))
+                        else:
+                            lhs = getattr(src, getattr(local, src_attr))
+                            rhs = getattr(dest, getattr(remote, dest_attr))
+                        exprs.append(lhs == rhs)
+                    on = reduce(operator.and_, exprs)
                 else:
-                    lhs = getattr(src, getattr(fk_field, src_attr))
-                    rhs = getattr(dest, getattr(fk_field.rel_field, dest_attr))
-                on = (lhs == rhs)
+                    src_attr = 'name' if src_is_model else 'column_name'
+                    dest_attr = 'name' if dest_is_model else 'column_name'
+                    if is_backref:
+                        lhs = getattr(dest, getattr(fk_field, dest_attr))
+                        rhs = getattr(src, getattr(fk_field.rel_field,
+                                                   src_attr))
+                    else:
+                        lhs = getattr(src, getattr(fk_field, src_attr))
+                        rhs = getattr(dest, getattr(fk_field.rel_field,
+                                                    dest_attr))
+                    on = (lhs == rhs)
 
             if not attr:
                 if fk_field is not None and not is_backref:
@@ -8562,6 +9099,7 @@ class ModelSelect(BaseModelSelect, Select):
                 else:
                     attr = dest_model._meta.name
             elif on_alias and fk_field is not None and \
+                    not isinstance(fk_field, CompositeForeignKeyField) and \
                     attr == fk_field.object_id_name and not is_backref:
                 raise ValueError('Cannot assign join alias to "%s", as this '
                                  'attribute is the object_id_name for the '
@@ -8606,7 +9144,8 @@ class ModelSelect(BaseModelSelect, Select):
                       else to_field)
             fk_fields = [f for f in fk_fields if (
                          (f is target) or
-                         (is_backref and f.rel_field is to_field))]
+                         (is_backref and
+                          getattr(f, 'rel_field', None) is to_field))]
 
         if len(fk_fields) == 1:
             return fk_fields[0], is_backref
@@ -9111,8 +9650,10 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
 
                     src_ctor = self.key_to_constructor.get(curr)
                     is_fk = (src_ctor is not None and src_ctor[1] and
-                             isinstance(src_ctor[0]._meta.fields.get(attr),
-                                        ForeignKeyField))
+                             (isinstance(src_ctor[0]._meta.fields.get(attr),
+                                         ForeignKeyField) or
+                              isinstance(getattr(src_ctor[0], attr, None),
+                                         CompositeForeignKeyField)))
                     # (src, attr, dest, src is dict?, is outer?,
                     # attr is src's fk?).
                     self.src_to_dest.append((
@@ -9260,6 +9801,27 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
         return objects[self.model]
 
 
+def _is_composite_fk(field):
+    field = field.field if isinstance(field, FieldAlias) else field
+    return isinstance(field, CompositeForeignKeyField)
+
+
+def _prefetch_field_name(field, is_backref):
+    # Single-column fks expose one attribute; composite fks expose one
+    # attribute per local/remote column, in declared pair order.
+    if _is_composite_fk(field):
+        underlying = field.field if isinstance(field, FieldAlias) else field
+        return ([f.name for f in underlying.rel_fields] if is_backref
+                else [f.name for f in underlying.local_fields])
+    return field.rel_field.name if is_backref else field.name
+
+
+def _prefetch_identity(instance, field, names):
+    if _is_composite_fk(field):
+        return tuple(instance.__data__[name] for name in names)
+    return instance.__data__[names]
+
+
 class PrefetchQuery(collections.namedtuple('_PrefetchQuery', (
     'query', 'fields', 'is_backref', 'rel_models', 'field_to_name', 'model'))):
     def __new__(cls, query, fields=None, is_backref=None, rel_models=None,
@@ -9268,11 +9830,13 @@ class PrefetchQuery(collections.namedtuple('_PrefetchQuery', (
             if is_backref:
                 if rel_models is None:
                     rel_models = [field.model for field in fields]
-                foreign_key_attrs = [field.rel_field.name for field in fields]
+                foreign_key_attrs = [_prefetch_field_name(field, True)
+                                     for field in fields]
             else:
                 if rel_models is None:
                     rel_models = [field.rel_model for field in fields]
-                foreign_key_attrs = [field.name for field in fields]
+                foreign_key_attrs = [_prefetch_field_name(field, False)
+                                     for field in fields]
             field_to_name = list(zip(fields, foreign_key_attrs))
         model = query.model
         return super(PrefetchQuery, cls).__new__(
@@ -9281,32 +9845,69 @@ class PrefetchQuery(collections.namedtuple('_PrefetchQuery', (
     def populate_instance(self, instance, id_map):
         if self.is_backref:
             for field in self.fields:
-                identifier = instance.__data__[field.name]
-                key = (field, identifier)
-                if key in id_map:
-                    setattr(instance, field.name, id_map[key])
-                    # setattr marks the fk dirty, but it holds the value just
-                    # loaded. Clear it so the row reflects db state.
-                    instance._dirty.discard(field.name)
+                if _is_composite_fk(field):
+                    underlying = (field.field if isinstance(field, FieldAlias)
+                                  else field)
+                    identifier = tuple(instance.__data__[local.name]
+                                       for local in underlying.local_fields)
+                    key = (underlying, identifier)
+                    if key in id_map:
+                        setattr(instance, underlying.name, id_map[key])
+                        instance._dirty.difference_update(
+                            local.name for local in underlying.local_fields)
+                else:
+                    identifier = instance.__data__[field.name]
+                    key = (field, identifier)
+                    if key in id_map:
+                        setattr(instance, field.name, id_map[key])
+                        # setattr marks the fk dirty, but it holds the value
+                        # just loaded. Clear it so the row reflects db state.
+                        instance._dirty.discard(field.name)
         else:
             for field, attname in self.field_to_name:
-                identifier = instance.__data__[field.rel_field.name]
-                key = (field, identifier)
-                rel_instances = id_map.get(key, [])
-                for inst in rel_instances:
-                    setattr(inst, attname, instance)
-                    inst._dirty.clear()
-                setattr(instance, field.backref, rel_instances)
+                if _is_composite_fk(field):
+                    underlying = (field.field if isinstance(field, FieldAlias)
+                                  else field)
+                    identifier = tuple(instance.__data__[name]
+                                       for name in attname)
+                    key = (underlying, identifier)
+                    rel_instances = id_map.get(key, [])
+                    for inst in rel_instances:
+                        setattr(inst, underlying.name, instance)
+                        inst._dirty.clear()
+                    setattr(instance, underlying.backref, rel_instances)
+                else:
+                    identifier = instance.__data__[field.rel_field.name]
+                    key = (field, identifier)
+                    rel_instances = id_map.get(key, [])
+                    for inst in rel_instances:
+                        setattr(inst, attname, instance)
+                        inst._dirty.clear()
+                    setattr(instance, field.backref, rel_instances)
 
     def store_instance(self, instance, id_map):
         for field, attname in self.field_to_name:
-            identity = field.rel_field.python_value(instance.__data__[attname])
-            key = (field, identity)
-            if self.is_backref:
-                id_map[key] = instance
+            if _is_composite_fk(field):
+                underlying = (field.field if isinstance(field, FieldAlias)
+                              else field)
+                if self.is_backref:
+                    identity = tuple(instance.__data__[local.name]
+                                     for local in underlying.local_fields)
+                    id_map[(underlying, identity)] = instance
+                else:
+                    identity = tuple(instance.__data__[name]
+                                     for name in attname)
+                    id_map.setdefault((underlying, identity), [])
+                    id_map[(underlying, identity)].append(instance)
             else:
-                id_map.setdefault(key, [])
-                id_map[key].append(instance)
+                identity = field.rel_field.python_value(
+                    instance.__data__[attname])
+                key = (field, identity)
+                if self.is_backref:
+                    id_map[key] = instance
+                else:
+                    id_map.setdefault(key, [])
+                    id_map[key].append(instance)
 
 
 def _parent_keys(parent_query, cols):
@@ -9348,6 +9949,27 @@ def _relate(query, parent_query, pairs, strategy):
     return query.where(expr)
 
 
+def _composite_in(local_fields, values):
+    # A composite relation is one row-value comparison, never several
+    # unrelated single-column predicates. local_fields are columns on the
+    # query being filtered, values are row tuples.
+    return Expression(NodeList(local_fields, ', ', True), OP.IN,
+                      _CompositeValueList(values))
+
+
+def _relate_composite(query, parent_query, local_fields, key_fields,
+                      strategy):
+    if strategy == PREFETCH_TYPE.JOIN:
+        sub = _parent_keys(parent_query, key_fields)
+        on = reduce(operator.and_,
+                    [local == getattr(sub.c, key.column_name)
+                     for local, key in zip(local_fields, key_fields)])
+        return query.join(sub, on=on)
+    return query.where(Expression(
+        NodeList(local_fields, ', ', True), OP.IN,
+        _parent_keys(parent_query, key_fields)))
+
+
 def prefetch_add_subquery(sq, subqueries, prefetch_type):
     fixed_queries = [PrefetchQuery(sq)]
     for i, subquery in enumerate(subqueries):
@@ -9369,7 +9991,11 @@ def prefetch_add_subquery(sq, subqueries, prefetch_type):
             rels = subquery_model._meta.model_refs.get(last_model, [])
             if rels:
                 fks = [getattr(subquery_model, fk.name) for fk in rels]
-                pks = [getattr(last_obj, fk.rel_field.name) for fk in rels]
+                pks = [getattr(last_obj, fk.rel_field.name)
+                       if not _is_composite_fk(fk)
+                       else [getattr(last_obj, rf.name)
+                             for rf in fk.rel_fields]
+                       for fk in rels]
             else:
                 backrefs = subquery_model._meta.model_backrefs.get(last_model)
             if (fks or backrefs) and ((target_model is last_obj) or
@@ -9384,13 +10010,34 @@ def prefetch_add_subquery(sq, subqueries, prefetch_type):
         dest = (target_model,) if target_model else None
 
         if fks:
-            subquery = _relate(subquery, last_query, list(zip(fks, pks)),
-                               prefetch_type)
+            if len(fks) == 1 and _is_composite_fk(fks[0]):
+                field = fks[0]
+                underlying = (field.field if isinstance(field, FieldAlias)
+                              else field)
+                local_fields = [getattr(subquery_model, lf.name)
+                                for lf in underlying.local_fields]
+                subquery = _relate_composite(subquery, last_query,
+                                             local_fields, pks[0],
+                                             prefetch_type)
+            else:
+                subquery = _relate(subquery, last_query, list(zip(fks, pks)),
+                                   prefetch_type)
             fixed_queries.append(PrefetchQuery(subquery, fks, False, dest))
         elif backrefs:
-            pairs = [(getattr(subquery_model, backref.rel_field.name),
-                      getattr(last_obj, backref.name)) for backref in backrefs]
-            subquery = _relate(subquery, last_query, pairs, prefetch_type)
+            if len(backrefs) == 1 and _is_composite_fk(backrefs[0]):
+                field = backrefs[0]
+                local_fields = [getattr(subquery_model, rf.name)
+                                for rf in field.rel_fields]
+                key_fields = [getattr(last_obj, lf.name)
+                              for lf in field.local_fields]
+                subquery = _relate_composite(subquery, last_query,
+                                             local_fields, key_fields,
+                                             prefetch_type)
+            else:
+                pairs = [(getattr(subquery_model, backref.rel_field.name),
+                          getattr(last_obj, backref.name))
+                         for backref in backrefs]
+                subquery = _relate(subquery, last_query, pairs, prefetch_type)
             fixed_queries.append(PrefetchQuery(subquery, backrefs, True, dest))
 
     return fixed_queries
@@ -9436,6 +10083,35 @@ def prefetch(sq, *subqueries, **kwargs):
 def _bucket(field, is_backref, children, parents):
     # Single-relation bucketing on the raw fk/key values writes __rel__ and
     # backref lists directly, skipping descriptor and dirty tracking.
+    if _is_composite_fk(field):
+        if is_backref:
+            # children carry the fk, parents get backref lists.
+            buckets = {}
+            for child in children:
+                key = tuple(child.__data__[lf.name]
+                            for lf in field.local_fields)
+                buckets.setdefault(key, []).append(child)
+            backref = field.backref
+            for parent in parents:
+                parent_key = tuple(parent.__data__[rf.name]
+                                   for rf in field.rel_fields)
+                rel = buckets.get(parent_key, [])
+                for inst in rel:
+                    inst.__rel__[field.name] = parent
+                setattr(parent, backref, rel)
+        else:
+            # children are the referenced rows, parents carry the fk.
+            id_map = {}
+            for child in children:
+                key = tuple(child.__data__[rf.name]
+                            for rf in field.rel_fields)
+                id_map[key] = child
+            for parent in parents:
+                key = tuple(parent.__data__[lf.name]
+                            for lf in field.local_fields)
+                if key in id_map:
+                    parent.__rel__[field.name] = id_map[key]
+        return
     name, rel_name = field.name, field.rel_field.name
     if is_backref:
         # children carry the fk, parents get backref lists.
@@ -9473,6 +10149,10 @@ class Load(Node):
                              'dicts/tuples/namedtuples.')
         if strategy not in PREFETCH_TYPE.values():
             raise ValueError('Load() strategy must be a PREFETCH_TYPE value.')
+        if per_parent is not None and isinstance(self._field,
+                                                 CompositeForeignKeyField):
+            raise ValueError('per_parent is not supported for composite '
+                             'foreign-key "%s".' % self._field.name)
         self._query = query
         self._strategy = strategy
         self._per_parent = per_parent
@@ -9482,9 +10162,9 @@ class Load(Node):
     def _resolve(rel):
         if isinstance(rel, FieldAlias):  # Tweet.alias().user -> Tweet.user.
             rel = rel.field
-        if isinstance(rel, BackrefAccessor):
+        if isinstance(rel, (BackrefAccessor, CompositeBackrefAccessor)):
             return rel.field, True
-        elif isinstance(rel, ForeignKeyField):
+        elif isinstance(rel, (ForeignKeyField, CompositeForeignKeyField)):
             return rel, False
         raise ValueError('Load() expects a foreign-key or backref reference, '
                          'got %r.' % rel)
@@ -9508,9 +10188,35 @@ class Load(Node):
                 keys.append(key)
         return keys
 
+    @staticmethod
+    def _distinct_composite(parents, get_row):
+        # Rows containing NULL cannot satisfy the composite comparison.
+        keys, seen = [], set()
+        for parent in parents:
+            row = get_row(parent)
+            if row is None or any(value is None for value in row):
+                continue
+            if row not in seen:
+                seen.add(row)
+                keys.append(row)
+        return keys
+
     def _link_children(self, query, parent_query, parents):
         # MATERIALIZE: use the parents' in-memory keys, not a subquery.
         field = self._field
+        if _is_composite_fk(field):
+            local_fields = [getattr(query.model, lf.name)
+                            for lf in field.local_fields]
+            if self._strategy == PREFETCH_TYPE.MATERIALIZE:
+                keys = self._distinct_composite(
+                    parents,
+                    lambda p: tuple(p.__data__[rf.name]
+                                    for rf in field.rel_fields))
+                return query.where(_composite_in(local_fields, keys))
+            key_fields = [getattr(parent_query.model, rf.name)
+                          for rf in field.rel_fields]
+            return _relate_composite(query, parent_query, local_fields,
+                                     key_fields, self._strategy)
         if self._strategy == PREFETCH_TYPE.MATERIALIZE:
             keys = self._distinct(parents,
                                   lambda p: getattr(p, field.rel_field.name))
@@ -9522,6 +10228,19 @@ class Load(Node):
 
     def _link_parent(self, query, parent_query, parents):
         field = self._field
+        if _is_composite_fk(field):
+            local_fields = [getattr(query.model, rf.name)
+                            for rf in field.rel_fields]
+            if self._strategy == PREFETCH_TYPE.MATERIALIZE:
+                keys = self._distinct_composite(
+                    parents,
+                    lambda p: tuple(p.__data__.get(lf.name)
+                                    for lf in field.local_fields))
+                return query.where(_composite_in(local_fields, keys))
+            key_fields = [getattr(parent_query.model, lf.name)
+                          for lf in field.local_fields]
+            return _relate_composite(query, parent_query, local_fields,
+                                     key_fields, self._strategy)
         if self._strategy == PREFETCH_TYPE.MATERIALIZE:
             keys = self._distinct(parents,
                                   lambda p: p.__data__.get(field.name))
