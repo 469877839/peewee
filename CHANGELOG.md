@@ -7,6 +7,12 @@ https://github.com/coleifer/peewee/releases
 
 ## master
 
+* Add `prefetch_window()` (and `ModelSelect.prefetch_window()`), a windowed
+  variant of `prefetch()` that streams the root query and loads relations
+  for `window_size` root rows at a time (one query per relation per window),
+  keeping memory bounded for large exports. Closing the generator early
+  closes the root cursor promptly.
+
 [View commits](https://github.com/coleifer/peewee/compare/4.5.3...master)
 
 ## 4.5.3

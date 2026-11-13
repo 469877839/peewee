@@ -131,6 +131,7 @@ __all__ = [
     'PostgresqlDatabase',
     'PrimaryKeyField',  # XXX: Deprecated, change to AutoField.
     'prefetch',
+    'prefetch_window',
     'PREFETCH_TYPE',
     'ProgrammingError',
     'Proxy',
@@ -8396,6 +8397,9 @@ class BaseModelSelect(_ModelQueryHelper):
     def prefetch(self, *subqueries, **kwargs):
         return prefetch(self, *subqueries, **kwargs)
 
+    def prefetch_window(self, window_size, *subqueries, **kwargs):
+        return prefetch_window(self, window_size, *subqueries, **kwargs)
+
     @Node.copy
     def with_related(self, *loads):
         # Accept fk/backref references, wrap w/Load().
@@ -9343,6 +9347,10 @@ def _relate(query, parent_query, pairs, strategy):
     # Pairs are (column on query, the column it matches on parent_query).
     if strategy == PREFETCH_TYPE.JOIN:
         return _join_parent_keys(query, parent_query, pairs)
+    elif strategy == PREFETCH_TYPE.MATERIALIZE:
+        # Parent keys are materialized in memory, so the query is returned
+        # unmodified. The caller (prefetch_window) constrains each window.
+        return query
     expr = reduce(operator.or_, [col << _parent_keys(parent_query, (key,))
                                  for col, key in pairs])
     return query.where(expr)
@@ -9431,6 +9439,100 @@ def prefetch(sq, *subqueries, **kwargs):
                     rel.populate_instance(instance, deps[rel.model])
 
     return list(pq.query)
+
+
+def _window_keys_query(pq, parents):
+    # Constrain a resolved subquery to one window of parents using their
+    # in-memory keys: one IN () per foreign-key pair, OR'd like _relate().
+    expressions = []
+    for field in pq.fields:
+        if pq.is_backref:
+            column, attr = field.rel_field, field.name
+        else:
+            column, attr = field, field.rel_field.name
+        keys, seen = [], set()
+        for parent in parents:
+            key = parent.__data__[attr]
+            if key is not None and key not in seen:
+                seen.add(key)
+                keys.append(key)
+        if keys:
+            expressions.append(column << keys)
+    if not expressions:
+        return None
+    return pq.query.where(reduce(operator.or_, expressions))
+
+
+def _load_prefetch_window(parents, fixed_queries):
+    # prefetch()'s store/populate passes scoped to a single window, with each
+    # subquery constrained to the window's materialized keys. Subqueries are
+    # resolved parent-first, so a forward pass can fetch each level from the
+    # instances already loaded for the levels above it.
+    rel_map = {}
+    for pq in fixed_queries[1:]:
+        for rel_model in pq.rel_models:
+            rel_map.setdefault(rel_model, []).append(pq)
+
+    deps = {}
+    window_instances = {}
+    pq_instances = []
+    for i, pq in enumerate(fixed_queries):
+        deps.setdefault(pq.model, {})
+        if i == 0:
+            instances = parents
+        else:
+            rel_parents = []
+            for rel_model in pq.rel_models:
+                rel_parents.extend(window_instances.get(rel_model, ()))
+            query = _window_keys_query(pq, rel_parents)
+            instances = list(query) if query is not None else []
+        pq_instances.append(instances)
+        window_instances.setdefault(pq.model, []).extend(instances)
+        if pq.fields:
+            id_map = deps[pq.model]
+            for instance in instances:
+                pq.store_instance(instance, id_map)
+
+    for i in reversed(range(len(fixed_queries))):
+        relations = rel_map.get(fixed_queries[i].model)
+        if not relations:
+            continue
+        for instance in pq_instances[i]:
+            for rel in relations:
+                rel.populate_instance(instance, deps[rel.model])
+
+
+def _prefetch_window_generator(sq, fixed_queries, window_size):
+    cursor_wrapper = sq.execute()
+    try:
+        result_iter = cursor_wrapper.iterator()
+        while True:
+            window = list(itertools.islice(result_iter, window_size))
+            if not window:
+                break
+            _load_prefetch_window(window, fixed_queries)
+            for instance in window:
+                yield instance
+    finally:
+        # A consumer that stops before exhausting the generator still
+        # releases the root cursor.
+        if not cursor_wrapper.populated:
+            cursor_wrapper.cursor.close()
+
+
+def prefetch_window(sq, window_size, *subqueries, **kwargs):
+    if kwargs:
+        raise ValueError('Unrecognized arguments: %s' % kwargs)
+    if not isinstance(window_size, int) or window_size < 1:
+        raise ValueError('window_size must be a positive integer.')
+    if getattr(sq, '_load_tree', None):
+        raise ValueError('with_related() is incompatible with '
+                         'prefetch_window().')
+    # MATERIALIZE leaves the subqueries unconstrained; each window restricts
+    # them with its own in-memory keys, one query per relation per window.
+    fixed_queries = prefetch_add_subquery(sq, subqueries,
+                                          PREFETCH_TYPE.MATERIALIZE)
+    return _prefetch_window_generator(sq, fixed_queries, window_size)
 
 
 def _bucket(field, is_backref, children, parents):

@@ -5,6 +5,9 @@ All models in this module except Package/PackageItem are local (not from
 base_models), because prefetch tests need specific relational graph shapes
 that differ from the shared models.
 """
+import gc
+import weakref
+
 from peewee import *
 
 from .base import requires_models
@@ -574,6 +577,189 @@ class C1(TestModel):
 class C2(TestModel):
     name = TextField()
     c = ForeignKeyField(C)
+
+
+# ===========================================================================
+# Windowed prefetch tests
+# ===========================================================================
+
+class TestPrefetchWindow(ModelTestCase):
+    requires = [Person, Note, NoteItem, Category]
+
+    def setUp(self):
+        super(TestPrefetchWindow, self).setUp()
+        # Five people; notes spell out which windows see children. p3 has no
+        # notes, so empty relations appear mid-stream.
+        data = (
+            ('p1', (('n1', ('i1', 'i2')), ('n2', ()))),
+            ('p2', (('n3', ()),)),
+            ('p3', ()),
+            ('p4', (('n4', ('i3',)), ('n5', ()), ('n6', ('i4',)))),
+            ('p5', (('n7', ()),)),
+        )
+        for name, notes in data:
+            person = Person.create(name=name)
+            for content, items in notes:
+                note = Note.create(person=person, content=content)
+                for item in items:
+                    NoteItem.create(note=note, content=item)
+
+    def accumulate(self, gen):
+        return [(p.name, [(n.content, [i.content for i in n.items])
+                          for n in p.notes])
+                for p in gen]
+
+    def test_windowed_delivery(self):
+        # 5 people in windows of 2 -> 3 windows. One root query plus, per
+        # window, one query per relation level (notes, then items).
+        query = Person.select().order_by(Person.id)
+        with self.assertQueryCount(1 + 3 * 2):
+            gen = query.prefetch_window(
+                2,
+                Note.select().order_by(Note.content),
+                NoteItem.select().order_by(NoteItem.content))
+            accum = self.accumulate(gen)
+
+        self.assertEqual(accum, [
+            ('p1', [('n1', ['i1', 'i2']), ('n2', [])]),
+            ('p2', [('n3', [])]),
+            ('p3', []),
+            ('p4', [('n4', ['i3']), ('n5', []), ('n6', ['i4'])]),
+            ('p5', [('n7', [])]),
+        ])
+
+    def test_execution_is_deferred(self):
+        # Building the generator runs no queries: no COUNT, no eager list.
+        with self.assertQueryCount(0):
+            gen = Person.select().prefetch_window(2, Note)
+        self.assertEqual([p.name for p in gen], ['p1', 'p2', 'p3', 'p4',
+                                                 'p5'])
+
+    def test_window_size_one(self):
+        query = Person.select().order_by(Person.id)
+        # p3 has no notes, so its window skips the (empty) items query.
+        with self.assertQueryCount(1 + 5 + 4):
+            gen = prefetch_window(query, 1, Note.select(), NoteItem.select())
+            accum = self.accumulate(gen)
+        self.assertEqual(len(accum), 5)
+
+    def test_invalid_window_size(self):
+        for bad in (0, -1, '2', None):
+            self.assertRaises(ValueError, prefetch_window,
+                              Person.select(), bad, Note)
+        self.assertRaises(ValueError, prefetch_window, Person.select(), 2,
+                          Note, prefetch_type=PREFETCH_TYPE.WHERE)
+
+    def test_no_subqueries(self):
+        query = Person.select().order_by(Person.id)
+        with self.assertQueryCount(1):
+            names = [p.name for p in query.prefetch_window(3)]
+        self.assertEqual(names, ['p1', 'p2', 'p3', 'p4', 'p5'])
+
+    def test_empty_root_query(self):
+        query = Person.select().where(Person.name == 'nobody')
+        with self.assertQueryCount(1):
+            self.assertEqual(list(query.prefetch_window(2, Note)), [])
+
+    def test_reverse_fk(self):
+        # Root on the many-side, prefetching the parent: one Person query
+        # per window of notes, constrained by the window's fk values.
+        query = Note.select().order_by(Note.id)
+        with self.assertQueryCount(1 + 3):
+            gen = query.prefetch_window(3, Person.select())
+            accum = [(n.content, n.person.name) for n in gen]
+        self.assertEqual(accum, [
+            ('n1', 'p1'), ('n2', 'p1'), ('n3', 'p2'), ('n4', 'p4'),
+            ('n5', 'p4'), ('n6', 'p4'), ('n7', 'p5')])
+
+    def test_duplicate_roots(self):
+        # A join multiplies root rows; duplicates can straddle a window
+        # boundary. Each row is delivered as its own object with relations
+        # loaded, and identity is not preserved across windows.
+        query = Person.select().join(Note).order_by(Person.id, Note.id)
+        with self.assertQueryCount(1 + 4):
+            people = list(query.prefetch_window(2, Note.select()))
+
+        self.assertEqual([p.name for p in people],
+                         ['p1', 'p1', 'p2', 'p4', 'p4', 'p4', 'p5'])
+        self.assertEqual([len(p.notes) for p in people],
+                         [2, 2, 1, 3, 3, 3, 1])
+
+        # Same-window duplicates share the window's child instances...
+        self.assertIsNot(people[0], people[1])
+        self.assertIs(people[0].notes[0], people[1].notes[0])
+        # ...but a root repeated in a later window gets fresh objects.
+        self.assertIsNot(people[3], people[4])
+        self.assertIsNot(people[3].notes[0], people[4].notes[0])
+        self.assertEqual(people[3].notes[0].id, people[4].notes[0].id)
+
+    def test_self_relation(self):
+        def cc(name, parent=None):
+            return Category.create(name=name, parent=parent)
+        root = cc('root')
+        p1 = cc('p1', root)
+        p2 = cc('p2', root)
+        cc('c1', p1)
+        cc('c2', p1)
+        cc('c3', p2)
+
+        Child = Category.alias('child')
+        query = Category.select().order_by(Category.id)
+        # 6 categories in windows of 2 -> 3 windows, 1 child query each.
+        with self.assertQueryCount(1 + 3):
+            gen = query.prefetch_window(2, Child)
+            accum = [(c.name, sorted(ch.name for ch in c.children))
+                     for c in gen]
+
+        self.assertEqual(accum, [
+            ('root', ['p1', 'p2']),
+            ('p1', ['c1', 'c2']),
+            ('p2', ['c3']),
+            ('c1', []),
+            ('c2', []),
+            ('c3', []),
+        ])
+
+    def test_window_bounds_live_objects(self):
+        # Only the current window's roots stay referenced while iterating.
+        gen = Person.select().order_by(Person.id).prefetch_window(2, Note)
+        refs = []
+        for person in gen:
+            refs.append(weakref.ref(person))
+            gc.collect()
+            alive = sum(1 for ref in refs if ref() is not None)
+            self.assertLessEqual(alive, 2)
+        del person
+        gc.collect()
+        self.assertEqual(sum(1 for ref in refs if ref() is not None), 0)
+
+    def test_root_cursor_closed_on_early_stop(self):
+        query = Person.select().order_by(Person.id)
+        gen = query.prefetch_window(2, Note)
+        next(gen)
+        cursor_wrapper = query._cursor_wrapper
+        self.assertFalse(cursor_wrapper.populated)
+
+        closed = []
+        cursor = cursor_wrapper.cursor
+
+        class CursorSpy(object):
+            def close(self):
+                closed.append(True)
+                cursor.close()
+
+            def __getattr__(self, attr):
+                return getattr(cursor, attr)
+
+        cursor_wrapper.cursor = CursorSpy()
+        gen.close()
+        self.assertEqual(closed, [True])
+
+    def test_root_cursor_closed_when_exhausted(self):
+        query = Person.select().order_by(Person.id)
+        gen = query.prefetch_window(2, Note)
+        self.assertEqual(len(list(gen)), 5)
+        self.assertTrue(query._cursor_wrapper.populated)
 
 
 class TestPrefetchMultiRefs(ModelTestCase):

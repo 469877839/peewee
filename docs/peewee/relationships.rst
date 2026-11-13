@@ -1253,6 +1253,46 @@ The filter on ``Tweet`` applies only to the prefetched tweets, it does not
 affect which users are returned. ``prefetch`` accepts the ``WHERE`` and ``JOIN``
 strategies through its ``prefetch_type`` keyword (see :ref:`prefetch-strategy`).
 
+Windowed prefetch
+^^^^^^^^^^^^^^^^^
+
+Both :func:`prefetch` and :meth:`~ModelSelect.with_related` hold the entire
+result set in memory, which is a problem when exporting a whole day of
+records. :func:`prefetch_window` delivers the same eager-loaded objects in
+windows of root rows:
+
+.. code-block:: python
+
+   # Streams the root query; per window of 100 users, one query per relation.
+   for user in prefetch_window(User.select(), 100, Tweet, Favorite):
+       export(user)
+
+   # Method form, mirroring ModelSelect.prefetch().
+   for user in User.select().prefetch_window(100, Tweet):
+       export(user)
+
+The root query is streamed from its cursor -- it is never counted or turned
+into a list -- and each window's relations are fetched with one query per
+relation, filtered on the window's in-memory keys. Only one window of objects
+is referenced at a time, so memory stays bounded no matter how many root rows
+match. Subqueries are resolved with the same rules as :func:`prefetch`,
+including ``(query, target_model)`` tuples, multi-level relations and
+self-referential foreign keys.
+
+Semantics to be aware of:
+
+* Root rows arrive in the root query's order. If a join repeats a root row,
+  each repetition is delivered with its relations loaded.
+* A parent with no related rows gets an empty back-reference list, as usual.
+* Objects are shared within a window but not across windows: if the same
+  database row appears in two windows (for example a duplicated root), each
+  window yields distinct Python objects for it.
+* Stopping iteration early (closing the generator, or letting it be
+  garbage-collected) closes the root query's cursor promptly.
+
+``prefetch_window`` cannot be combined with
+:meth:`~ModelSelect.with_related` on the same query.
+
 Choosing between joins and eager loading
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 

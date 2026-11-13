@@ -2874,6 +2874,26 @@ Model
          # Favorite will be attached to User (via Favorite.user), not to Tweet.
          query = prefetch(users, tweets, (favorites, User))
 
+   .. method:: prefetch_window(window_size, *subqueries)
+
+      :param window_size: Number of root rows to load relations for at a
+          time.
+      :param subqueries: A list of :class:`Model` classes or select
+          queries to prefetch, resolved exactly like :func:`prefetch`.
+      :return: a generator yielding root models with their relations
+          prefetched, one window at a time.
+
+      Like :meth:`prefetch`, but instead of materializing the whole result
+      set, the root query is streamed and relations are loaded for
+      ``window_size`` root rows at a time (one query per relation per
+      window). This keeps memory bounded for large exports. See
+      :func:`prefetch_window` for the full semantics.
+
+      .. code-block:: python
+
+         for user in User.select().prefetch_window(100, Tweet):
+             print(user.username, len(user.tweets))
+
    .. method:: with_related(*loads)
 
       :param loads: One or more :class:`Load` nodes, or foreign-key /
@@ -6658,6 +6678,41 @@ Queries
    necessary to be sure that the foreign-key/primary-key of any
    related models are selected, so that the related objects can be
    mapped correctly.
+
+
+.. function:: prefetch_window(sq, window_size, *subqueries)
+
+   :param sq: Query to use as starting-point.
+   :param window_size: Number of root rows to load relations for at a time.
+   :param subqueries: One or more models or :class:`ModelSelect` queries
+       to eagerly fetch, resolved exactly like :func:`prefetch`.
+   :return: a generator yielding root models with their relations prefetched,
+       one window at a time.
+
+   Windowed variant of :func:`prefetch` for large result sets. The root query
+   is streamed (never counted or materialized as a whole), and each window of
+   ``window_size`` root rows has its relations loaded with one query per
+   relation, filtered on the window's in-memory keys. Only one window of
+   results is referenced at a time, so memory stays bounded.
+
+   .. code-block:: python
+
+      for user in prefetch_window(User.select(), 100, Tweet):
+          print(user.username, len(user.tweets))
+
+   Semantics:
+
+   * Root rows are delivered in the root query's order; a root row repeated
+     by a join is delivered once per row, each with its relations loaded.
+   * Multi-level relations, empty relations and self-referential foreign
+     keys behave as in :func:`prefetch`, scoped to the current window.
+   * Objects are shared within a window but not across windows: the same
+     database row appearing in two windows yields distinct Python objects.
+   * Closing the generator (or letting it be garbage-collected) before it is
+     exhausted closes the root query's cursor promptly.
+
+   ``prefetch_window`` cannot be combined with
+   :meth:`~ModelSelect.with_related` on the same query.
 
 
 .. class:: Load(rel[, query=None[, strategy=PREFETCH_TYPE.WHERE[, per_parent=None]]])
