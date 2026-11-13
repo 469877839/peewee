@@ -8,6 +8,8 @@ import gc
 import os
 import platform
 import re
+import shutil
+import tempfile
 import threading
 import time
 import warnings
@@ -407,6 +409,305 @@ class TestDatabase(DatabaseTestCase):
         result = do_work()
         self.assertEqual(result, (1,))
         self.assertTrue(db2.is_closed())
+
+
+class _RecordingDatabase(SqliteDatabase):
+    """Records the connection object and thread used for each query."""
+    def __init__(self, *args, **kwargs):
+        super(_RecordingDatabase, self).__init__(*args, **kwargs)
+        self.executed = []  # List of (connection, thread-ident) tuples.
+
+    def execute(self, query, **context_options):
+        self.executed.append((self.connection(), threading.get_ident()))
+        return super(_RecordingDatabase, self).execute(query,
+                                                       **context_options)
+
+
+class TestUsingDatabase(BaseTestCase):
+    """Tests for the context-local database binding (using_database)."""
+    def setUp(self):
+        super(TestUsingDatabase, self).setUp()
+        self.tmpdir = tempfile.mkdtemp(prefix='peewee-using-db-')
+        self.db1 = _RecordingDatabase(
+            os.path.join(self.tmpdir, 'export_a.db'))
+        self.db2 = _RecordingDatabase(
+            os.path.join(self.tmpdir, 'export_b.db'))
+
+        db1 = self.db1
+
+        class User(Model):
+            username = CharField(unique=True)
+            class Meta:
+                database = db1
+                table_name = 'user'
+
+        class Tweet(Model):
+            user = ForeignKeyField(User, backref='tweets')
+            content = TextField()
+            class Meta:
+                database = db1
+                table_name = 'tweet'
+
+        # Create the schema in both databases using the existing bind_ctx
+        # interface, so the model metadata always points at db1.
+        for db in (self.db1, self.db2):
+            with db.bind_ctx([User, Tweet]):
+                db.create_tables([User, Tweet])
+
+        self.User = User
+        self.Tweet = Tweet
+
+    def tearDown(self):
+        self.db1.close()
+        self.db2.close()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        super(TestUsingDatabase, self).tearDown()
+
+    def names(self, db):
+        query = (self.User.select()
+                 .order_by(self.User.username)
+                 .bind(db))  # Explicitly-bound verification query.
+        return [user.username for user in query]
+
+    def test_interleaved_contexts_route_queries(self):
+        U = self.User
+        U.create(username='main-1')
+        with using_database(self.db2):
+            U.create(username='ctx-1')
+            # The model metadata is never rewritten by the context.
+            self.assertIs(U._meta.database, self.db1)
+            with using_database(self.db1):
+                U.create(username='nested-1')
+            # Innermost context exited: db2 binding is restored.
+            U.create(username='ctx-2')
+        U.create(username='main-2')
+
+        self.assertEqual(self.names(self.db1),
+                         ['main-1', 'main-2', 'nested-1'])
+        self.assertEqual(self.names(self.db2), ['ctx-1', 'ctx-2'])
+
+        # Connection ownership: every query executed against a database
+        # used that database's own (this thread's) connection.
+        conn1 = self.db1.connection()
+        conn2 = self.db2.connection()
+        self.assertIsNot(conn1, conn2)
+        self.assertTrue(self.db1.executed)
+        self.assertTrue(self.db2.executed)
+        for conn, ident in self.db1.executed:
+            self.assertIs(conn, conn1)
+        for conn, ident in self.db2.executed:
+            self.assertIs(conn, conn2)
+
+    def test_resolution_happens_at_execution_time(self):
+        U = self.User
+        U.create(username='in-db1')
+        with using_database(self.db2):
+            U.create(username='in-db2')
+
+        # A query constructed outside any context does not capture a
+        # database: it follows the context that is active when it executes.
+        query = U.select().order_by(U.username)
+        with using_database(self.db2):
+            self.assertEqual([u.username for u in query], ['in-db2'])
+        fresh = U.select().order_by(U.username)
+        self.assertEqual([u.username for u in fresh], ['in-db1'])
+
+        # Same for a write query constructed before entering the context.
+        insert = U.insert(username='deferred')
+        with using_database(self.db2):
+            insert.execute()
+        self.assertEqual(self.names(self.db1), ['in-db1'])
+        self.assertEqual(self.names(self.db2), ['deferred', 'in-db2'])
+
+    def test_binding_precedence(self):
+        U = self.User
+        U.create(username='meta')
+        with using_database(self.db2):
+            U.create(username='ctx')
+
+        with using_database(self.db2):
+            # 1. Explicitly-bound queries always use their own binding.
+            bound = U.select().bind(self.db1)
+            self.assertEqual([u.username for u in bound], ['meta'])
+            # 2. Unbound queries follow the active context.
+            self.assertEqual([u.username for u in U.select()], ['ctx'])
+            # 3. The context also takes precedence over the model's
+            # metadata, even when it is (re)bound with the old interface.
+            with U.bind_ctx(self.db1):
+                self.assertEqual([u.username for u in U.select()], ['ctx'])
+            self.assertIs(U._meta.database, self.db1)
+
+        # Outside any context the model metadata is used.
+        self.assertEqual([u.username for u in U.select()], ['meta'])
+        # An explicitly-bound query ignores the model metadata as well.
+        bound = U.select().bind(self.db2)
+        self.assertEqual([u.username for u in bound], ['ctx'])
+
+    def test_raw_queries_and_writes_follow_context(self):
+        U = self.User
+        U.create(username='raw-1')
+        with using_database(self.db2):
+            U.create(username='raw-2')
+            rows = list(U.raw('SELECT username FROM "user"').tuples())
+            self.assertEqual([row[0] for row in rows], ['raw-2'])
+            # Updates and deletes route the same way.
+            U.update(username='renamed').where(
+                U.username == 'raw-2').execute()
+            U.delete().where(U.username == 'renamed').execute()
+            self.assertEqual(U.select().count(), 0)
+
+        rows = list(U.raw('SELECT username FROM "user"').tuples())
+        self.assertEqual([row[0] for row in rows], ['raw-1'])
+        self.assertEqual(self.names(self.db1), ['raw-1'])
+        self.assertEqual(self.names(self.db2), [])
+
+    def test_related_models_follow_context(self):
+        U, T = self.User, self.Tweet
+        with using_database(self.db2):
+            user = U.create(username='huey')
+            T.create(user=user, content='tweet-1')
+            T.create(user=user, content='tweet-2')
+            query = (T.select(T, U)
+                     .join(U)
+                     .order_by(T.content))
+            self.assertEqual(
+                [(t.content, t.user.username) for t in query],
+                [('tweet-1', 'huey'), ('tweet-2', 'huey')])
+            # Prefetch issues one query per model; both honor the context.
+            users = prefetch(U.select(), T.select())
+            self.assertEqual(
+                sorted(t.content for t in users[0].tweets),
+                ['tweet-1', 'tweet-2'])
+
+        self.assertEqual(self.names(self.db1), [])
+        self.assertEqual(T.select().bind(self.db1).count(), 0)
+        self.assertEqual(T.select().bind(self.db2).count(), 2)
+
+    def test_transactions_follow_context(self):
+        U = self.User
+        with using_database(self.db2):
+            with self.db2.atomic():
+                U.create(username='committed')
+            try:
+                with self.db2.atomic():
+                    U.create(username='rolled-back')
+                    raise RuntimeError('boom')
+            except RuntimeError:
+                pass
+            # get_or_create() wraps its create in a transaction on the
+            # resolved (context) database.
+            obj, created = U.get_or_create(username='goc')
+            self.assertTrue(created)
+
+        self.assertEqual(self.names(self.db1), [])
+        self.assertEqual(self.names(self.db2), ['committed', 'goc'])
+
+    def test_exception_restores_binding(self):
+        U = self.User
+        try:
+            with using_database(self.db2):
+                U.create(username='before-boom')
+                with using_database(self.db1):
+                    raise RuntimeError('boom')
+        except RuntimeError:
+            pass
+
+        # Both nested contexts were unwound: the model metadata (db1) is
+        # used again, and db2 kept only what was written before the error.
+        U.create(username='after')
+        self.assertEqual(self.names(self.db1), ['after'])
+        self.assertEqual(self.names(self.db2), ['before-boom'])
+
+    def test_schema_operations_follow_context(self):
+        U = self.User
+        with using_database(self.db2):
+            self.assertTrue(U.table_exists())
+            U.drop_table()
+            self.assertFalse(U.table_exists())
+        # The model's own database was not touched.
+        self.assertTrue(U.table_exists())
+
+    def test_proxy_follows_same_rules(self):
+        proxy = DatabaseProxy()
+        proxy.initialize(self.db1)
+
+        class PUser(Model):
+            username = CharField()
+            class Meta:
+                database = proxy
+                table_name = 'user'
+
+        self.User.create(username='via-meta')
+        with using_database(self.db2):
+            self.User.create(username='via-ctx')
+
+        # The proxy resolves to its underlying database...
+        self.assertEqual([u.username for u in PUser.select()], ['via-meta'])
+        with using_database(self.db2):
+            # ...but the context takes precedence over the proxy metadata,
+            # while an explicit binding through the proxy is honored.
+            self.assertEqual([u.username for u in PUser.select()],
+                             ['via-ctx'])
+            bound = PUser.select().bind(proxy)
+            self.assertEqual([u.username for u in bound], ['via-meta'])
+
+    def test_using_method_and_decorator(self):
+        U = self.User
+        with self.db2.using():
+            U.create(username='method')
+
+        @using_database(self.db2)
+        def read_names():
+            return [u.username for u in U.select()]
+
+        @self.db1.using()
+        def create_name(username):
+            U.create(username=username)
+
+        create_name('decorated')
+        self.assertEqual(read_names(), ['method'])
+        self.assertEqual(self.names(self.db1), ['decorated'])
+        self.assertEqual(self.names(self.db2), ['method'])
+
+    def test_threads_are_isolated(self):
+        U = self.User
+        self.db1.executed = []
+        self.db2.executed = []
+        barrier = threading.Barrier(3)
+        results = {}
+
+        def worker(db, key):
+            with using_database(db):
+                # Both thread-local contexts are active at the same time.
+                barrier.wait(timeout=10)
+                U.create(username=key)
+                results[key] = [u.username for u in U.select()]
+                results['%s-conn' % key] = db.connection()
+
+        t1 = threading.Thread(target=worker, args=(self.db1, 't1'))
+        t2 = threading.Thread(target=worker, args=(self.db2, 't2'))
+        t1.start()
+        t2.start()
+        barrier.wait(timeout=10)
+        t1.join()
+        t2.join()
+
+        # Each thread's unbound queries used its own context database...
+        self.assertEqual(results['t1'], ['t1'])
+        self.assertEqual(results['t2'], ['t2'])
+        # ...and neither thread borrowed the other thread's connection.
+        self.assertIsNot(results['t1-conn'], results['t2-conn'])
+        idents = {t1.ident: self.db1, t2.ident: self.db2}
+        for db in (self.db1, self.db2):
+            self.assertTrue(db.executed)
+            for conn, ident in db.executed:
+                self.assertIs(db, idents[ident])
+                key = 't1' if ident == t1.ident else 't2'
+                self.assertIs(conn, results['%s-conn' % key])
+
+        # The main thread was unaffected by the worker contexts.
+        self.assertEqual(self.names(self.db1), ['t1'])
+        self.assertEqual(self.names(self.db2), ['t2'])
 
 
 class TestQueryHooks(ModelTestCase):

@@ -762,6 +762,21 @@ Database
                    # ... models are bound to test database ...
                    pass
 
+   .. method:: using()
+
+      Return a context-manager/decorator that routes unbound queries to this
+      database for the duration of the wrapped block, without modifying any
+      model metadata. Equivalent to ``using_database(db)``. See
+      :ref:`using_database` for details and the precedence rules.
+
+      Example:
+
+      .. code-block:: python
+
+          with archive_db.using():
+              # Unbound queries execute against archive_db.
+              tweets = Tweet.select().execute()
+
    .. method:: extract_date(date_part, date_field)
 
       :param str date_part: date part to extract, e.g. 'year'.
@@ -6972,6 +6987,27 @@ Constants and Helpers
           database = PostgresqlDatabase('production')
 
       db.initialize(database)
+
+.. function:: using_database(database)
+
+   :param database: a :class:`Database` instance (or a :class:`Proxy` /
+       :class:`DatabaseProxy` that resolves to one).
+   :return: a context-manager/decorator.
+
+   Route unbound queries to the given database for the duration of the
+   wrapped block, without modifying any model metadata. The binding is
+   thread-local, is restored on exit (including exceptional exits), and may
+   be nested. The database is chosen at execution time with the following
+   precedence:
+
+   1. An explicit :meth:`Query.bind` binding (or the ``database`` argument
+      to ``execute()`` and friends).
+   2. The innermost active ``using_database()`` context.
+   3. The model's own database (``Meta.database`` / :meth:`Model.bind` /
+      :meth:`Model.bind_ctx`).
+
+   See :ref:`using_database` for examples. Also available as
+   :meth:`Database.using`.
 
 .. function:: chunked(it, n)
 

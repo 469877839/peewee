@@ -147,6 +147,7 @@ __all__ = [
     'TimestampField',
     'Tuple',
     'UUIDField',
+    'using_database',
     'Value',
     'ValuesList',
     'Window',
@@ -498,6 +499,79 @@ class _callable_context_manager(object):
             with self._build_ctx():
                 return fn(*args, **kwargs)
         return inner
+
+
+class _DatabaseContextState(threading.local):
+    def __init__(self):
+        self.stack = []
+
+_db_context_state = _DatabaseContextState()
+
+
+def _resolve_database(explicit=None, model=None):
+    # Single point of truth for choosing which database a query (or schema
+    # operation) executes against. The database is resolved at execution
+    # time, using the following precedence:
+    #
+    # 1. An explicitly-bound database (Query.bind(), SchemaManager(db), or
+    #    the "database" argument to execute()/scalar()/etc).
+    # 2. The innermost using_database() context active on the current
+    #    thread.
+    # 3. The model's own database (Meta.database / Model.bind()).
+    if explicit is not None:
+        return explicit
+    stack = _db_context_state.stack
+    if stack:
+        return stack[-1]
+    if model is not None:
+        return model._meta.database
+    return None
+
+
+class _DatabaseContext(_callable_context_manager):
+    def __init__(self, database):
+        self.database = database
+
+    def _build_ctx(self):
+        return type(self)(self.database)
+
+    def __enter__(self):
+        _db_context_state.stack.append(self.database)
+        return self.database
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        stack = _db_context_state.stack
+        if stack and stack[-1] is self.database:
+            stack.pop()
+        elif self.database in stack:
+            # Defensive: tolerate out-of-order exits.
+            stack.remove(self.database)
+
+
+def using_database(database):
+    """
+    Context-manager (or decorator) that routes database queries to the
+    given database for the duration of the block, without modifying any
+    model's metadata. The binding is local to the current thread, so
+    interleaved contexts in different threads (or nested contexts in a
+    single thread) do not interfere with each other.
+
+    Database resolution precedence (highest first):
+
+    1. Queries explicitly bound via Query.bind(database) always execute
+       against their own binding.
+    2. Unbound queries execute against the innermost active
+       ``using_database()`` context.
+    3. Otherwise the model's own database (Meta.database, Model.bind() or
+       Model.bind_ctx()) is used.
+
+    Example:
+
+        with using_database(export_db):
+            for row in SomeModel.select():
+                ...
+    """
+    return _DatabaseContext(database)
 
 
 class Proxy(object):
@@ -2142,6 +2216,19 @@ class BaseQuery(Node):
         self._row_type = None
         self._constructor = None
         super(BaseQuery, self).__init__(**kwargs)
+
+    @property
+    def _database(self):
+        # The database a query executes against is resolved at execution
+        # time (not when the query is constructed), via _resolve_database():
+        # an explicit Query.bind() always wins, then the current thread's
+        # innermost using_database() context, then the model's database.
+        return _resolve_database(getattr(self, '_explicit_database', None),
+                                 getattr(self, 'model', None))
+
+    @_database.setter
+    def _database(self, database):
+        self._explicit_database = database
 
     def bind(self, database=None):
         self._database = database
@@ -4134,6 +4221,12 @@ class Database(_callable_context_manager):
 
     def bind_ctx(self, models, bind_refs=True, bind_backrefs=True):
         return _BoundModelsContext(models, self, bind_refs, bind_backrefs)
+
+    def using(self):
+        # Context-manager/decorator that routes unbound queries to this
+        # database for the duration of the block, without modifying any
+        # model metadata. See using_database() for the precedence rules.
+        return _DatabaseContext(self)
 
     def get_noop_select(self, ctx):
         return ctx.literal('SELECT 0 WHERE 0')
@@ -7035,7 +7128,7 @@ class SchemaManager(object):
 
     @property
     def database(self):
-        db = self._database or self.model._meta.database
+        db = _resolve_database(self._database, self.model)
         if db is None:
             raise ImproperlyConfigured('database attribute does not appear to '
                                        'be set on the model: %s' % self.model)
@@ -7537,7 +7630,6 @@ class Metadata(object):
 
     def set_database(self, database):
         self.database = database
-        self.model._schema.database = database
         del self.table
 
         # Apply any hooks that have been registered. If we have an
@@ -7952,7 +8044,7 @@ class Model(Node, metaclass=ModelBase):
             try:
                 if defaults:
                     kwargs.update(defaults)
-                with cls._meta.database.atomic():
+                with _resolve_database(model=cls).atomic():
                     return cls.create(**kwargs), True
             except IntegrityError as exc:
                 try:
@@ -8295,11 +8387,6 @@ def sort_models(models):
 
 class _ModelQueryHelper(object):
     default_row_type = ROW.MODEL
-
-    def __init__(self, *args, **kwargs):
-        super(_ModelQueryHelper, self).__init__(*args, **kwargs)
-        if not self._database:
-            self._database = self.model._meta.database
 
     @Node.copy
     def objects(self, constructor=None):

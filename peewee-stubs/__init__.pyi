@@ -919,6 +919,7 @@ class Database(_callable_context_manager):
     def bind_ctx(
         self, models: Iterable[type[_Model]], bind_refs: bool = True, bind_backrefs: bool = True
     ) -> _BoundModelsContext: ...
+    def using(self) -> _DatabaseContext: ...
     def get_noop_select(self, ctx): ...
     @property
     def Model(self) -> type[_Model]: ...
@@ -1879,6 +1880,16 @@ class _BoundModelsContext(_callable_context_manager):
         self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: TracebackType | None
     ) -> None: ...
 
+class _DatabaseContext(_callable_context_manager):
+    database: Incomplete
+    def __init__(self, database: _DatabaseType) -> None: ...
+    def __enter__(self): ...
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: TracebackType | None
+    ) -> None: ...
+
+def using_database(database: _DatabaseType) -> _DatabaseContext: ...
+
 class Model(metaclass=ModelBase):
     DoesNotExist: ClassVar[type[DoesNotExist]]
     __data__: Incomplete
@@ -2215,6 +2226,7 @@ __all__ = [
     "TimestampField",
     "Tuple",
     "UUIDField",
+    "using_database",
     "Value",
     "ValuesList",
     "Window",

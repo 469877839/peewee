@@ -7,6 +7,14 @@ https://github.com/coleifer/peewee/releases
 
 ## master
 
+* Add `using_database()` / `Database.using()`, a thread-local
+  context-manager/decorator that routes unbound queries to a database without
+  rewriting model metadata, making it safe to interleave queries against
+  multiple databases in one process. Database selection now happens at query
+  execution time through a single resolution rule: an explicit `Query.bind()`
+  wins, then the innermost active `using_database()` context, then the
+  model's own database (`Meta.database` / `Model.bind()`).
+
 [View commits](https://github.com/coleifer/peewee/compare/4.5.3...master)
 
 ## 4.5.3

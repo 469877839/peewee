@@ -363,6 +363,51 @@ the :class:`~playhouse.shortcuts.ThreadSafeDatabaseMetadata`.
        class Meta:
            model_metadata_class = ThreadSafeDatabaseMetadata
 
+.. _using_database:
+
+Context-local database binding
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The ``bind()`` / ``bind_ctx()`` methods described above work by rewriting the
+model's metadata (``Model._meta.database``). When a single process needs to
+*interleave* queries against multiple databases -- for example, exporting the
+same models from two different databases in turn -- rewriting shared metadata
+on every switch is both inefficient and unsafe.
+
+For this scenario peewee provides :func:`using_database` (also available as
+:meth:`Database.using`), a context-manager/decorator that routes queries to a
+database **without touching any model metadata**. The binding is stored in a
+thread-local stack, so nested and interleaved contexts are independent, and
+the previous binding is restored when the block exits -- even when an
+exception is raised.
+
+.. code-block:: python
+
+   archive_db = SqliteDatabase('archive.db')
+
+   with using_database(archive_db):
+       # Unbound queries run against archive_db here. The model's
+       # Meta.database is not modified.
+       for tweet in Tweet.select():
+           archive_tweet(tweet)
+
+The database a query executes against is chosen at **execution time** (not
+when the query is constructed), using a single resolution rule for selects,
+writes, raw queries, related-model joins, schema operations and transactions.
+The precedence is:
+
+1. A query explicitly bound with :meth:`Query.bind` (or the ``database``
+   argument to ``execute()`` and friends) always uses its own binding.
+2. Otherwise, the innermost active :func:`using_database` context on the
+   current thread is used.
+3. Otherwise, the model's own database is used (``Meta.database``,
+   :meth:`Model.bind`, :meth:`Model.bind_ctx`, or a :class:`Proxy` /
+   :class:`DatabaseProxy`, which is resolved as usual).
+
+Because the resolution happens per-thread, two threads can each enter their
+own ``using_database()`` context and execute queries concurrently -- each
+thread uses its own database and its own connection.
+
 Connecting via URL
 ------------------
 
