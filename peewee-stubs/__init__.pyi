@@ -1302,6 +1302,27 @@ class IdentityField(AutoField[_V]):
         cls, *args: Any, generate_always: bool = False, **kwargs: Unpack[_FieldKwargs]
     ) -> IdentityField[int]: ...
 
+class IdentityScopeConflict(TypedDict):
+    model: type[Model]
+    identity: tuple[Any, ...]
+    field: str
+    database_value: Any
+    local_value: Any
+
+class IdentityScope:
+    conflicts: list[IdentityScopeConflict]
+    @property
+    def identity_map(self) -> dict[tuple[type[Model], tuple[Any, ...]], Model]: ...
+    def __enter__(self) -> Self: ...
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None: ...
+
+def identity_scope() -> IdentityScope: ...
+
 class PrimaryKeyField(AutoField[_V]):
     def __new__(cls, *args: Any, **kwargs: Unpack[_FieldKwargs]) -> PrimaryKeyField[int]: ...
 
@@ -2179,6 +2200,8 @@ __all__ = [
     "fn",
     "ForeignKeyField",
     "IdentityField",
+    "IdentityScopeConflict",
+    "IdentityScope",
     "ImproperlyConfigured",
     "Index",
     "IntegerField",
@@ -2218,4 +2241,5 @@ __all__ = [
     "Value",
     "ValuesList",
     "Window",
+    "identity_scope",
 ]

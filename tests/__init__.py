@@ -13,6 +13,8 @@ from . import db_tests
 MODULES.append(db_tests)
 from . import fields
 MODULES.append(fields)
+from . import identity_scope
+MODULES.append(identity_scope)
 from . import manytomany
 MODULES.append(manytomany)
 from . import models

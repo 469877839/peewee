@@ -9,6 +9,7 @@ from functools import wraps
 from inspect import isclass
 import calendar
 import collections
+import contextvars
 import datetime
 import decimal
 import hashlib
@@ -111,6 +112,8 @@ __all__ = [
     'fn',
     'ForeignKeyField',
     'IdentityField',
+    'IdentityScopeConflict',
+    'IdentityScope',
     'ImproperlyConfigured',
     'Index',
     'IntegerField',
@@ -150,6 +153,7 @@ __all__ = [
     'Value',
     'ValuesList',
     'Window',
+    'identity_scope',
 ]
 
 logger = logging.getLogger('peewee')
@@ -2205,9 +2209,16 @@ class BaseQuery(Node):
         return await database.run(self.execute, database)
 
     def _execute(self, database):
-        if self._cursor_wrapper is None:
+        current_scope = _identity_scope.get()
+        scope_changed = (
+            self._cursor_wrapper is not None and
+            hasattr(self._cursor_wrapper, '_identity_scope') and
+            self._cursor_wrapper._identity_scope is not current_scope)
+        if self._cursor_wrapper is None or scope_changed:
             cursor = database.execute(self)
             self._cursor_wrapper = self._get_cursor_wrapper(cursor)
+            if isinstance(self, _ModelQueryHelper):
+                self._cursor_wrapper._identity_scope = current_scope
         return self._cursor_wrapper
 
     def iterator(self, database=None):
@@ -5344,6 +5355,158 @@ class _savepoint(_callable_context_manager):
             except Exception:
                 self.rollback(begin=False)
                 raise
+
+
+_identity_scope = contextvars.ContextVar('peewee_identity_scope', default=None)
+
+
+class IdentityScopeConflict(dict):
+    pass
+
+
+class IdentityScope(_callable_context_manager):
+    """Identity map scoped to explicit model fetching work."""
+
+    def __init__(self):
+        self._identity_map = {}
+        self._token = None
+        self.conflicts = []
+
+    @property
+    def identity_map(self):
+        return self._identity_map
+
+    def _identity_key(self, model, instance):
+        meta = model._meta
+        if meta.primary_key is False:
+            return
+        values = []
+        for field in meta.get_primary_keys():
+            if field.name not in instance.__data__:
+                return
+            value = instance.__data__[field.name]
+            if value is None:
+                return
+            values.append(value)
+        return (model, tuple(values))
+
+    def _primary_key_is_dirty(self, model, instance):
+        return any(field.name in instance._dirty
+                   for field in model._meta.get_primary_keys())
+
+    def _existing_pk_is_dirty(self, model, instance):
+        key = self._identity_key(model, instance)
+        if key is None:
+            return False
+        existing = self._identity_map.get(key)
+        return existing is not None and self._primary_key_is_dirty(
+            model, existing)
+
+    def load(self, instance, is_cursor_row=False):
+        model = type(instance)
+        if not is_cursor_row and self._primary_key_is_dirty(model, instance):
+            return instance
+        if is_cursor_row and self._existing_pk_is_dirty(model, instance):
+            return instance
+
+        key = self._identity_key(model, instance)
+        if key is None:
+            return instance
+
+        existing = self._identity_map.get(key)
+        if existing is None:
+            self._identity_map[key] = instance
+            instance._dirty.clear()
+            return instance
+
+        merged = False
+        for name in tuple(instance.__data__):
+            if name in existing._dirty:
+                self.conflicts.append(IdentityScopeConflict({
+                    'model': model,
+                    'identity': key[1],
+                    'field': name,
+                    'database_value': instance.__data__[name],
+                    'local_value': existing.__data__[name],
+                }))
+                continue
+            existing.__data__[name] = instance.__data__[name]
+            merged = True
+        if merged:
+            instance._dirty.clear()
+        return existing
+
+    def merge_model_graph(self, objects, model_list, protected):
+        canonical = {}
+        for instance in model_list:
+            model = type(instance)
+            if self._existing_pk_is_dirty(model, instance):
+                canonical[id(instance)] = instance
+                instance._dirty.clear()
+                continue
+
+            key = self._identity_key(model, instance)
+            if key is None:
+                canonical[id(instance)] = instance
+                instance._dirty.clear()
+                continue
+
+            existing = self._identity_map.get(key)
+            if existing is None:
+                self._identity_map[key] = instance
+                existing = instance
+            canonical[id(instance)] = existing
+
+            for name in tuple(instance.__data__):
+                if name in existing._dirty:
+                    self.conflicts.append(IdentityScopeConflict({
+                        'model': model,
+                        'identity': key[1],
+                        'field': name,
+                        'database_value': instance.__data__[name],
+                        'local_value': existing.__data__[name],
+                    }))
+                    continue
+                existing.__data__[name] = instance.__data__[name]
+
+        for key, value in list(objects.items()):
+            if isinstance(value, Model):
+                objects[key] = canonical[id(value)]
+        return objects, canonical, protected
+
+    def restore_dirty_fields(self, objects, protected, relations):
+        restored = set()
+        for instance_id, (dirty, data, rels) in protected.items():
+            instance = next(obj for obj in objects.values()
+                            if isinstance(obj, Model) and id(obj) == instance_id)
+            for name in dirty:
+                instance.__data__[name] = data[name]
+                if name in rels:
+                    instance.__rel__[name] = rels[name]
+                else:
+                    instance.__rel__.pop(name, None)
+                instance._dirty.add(name)
+                restored.add((instance, name))
+
+        for src, attr, dest, is_dict, is_outer, is_fk in relations:
+            if is_dict or not is_fk:
+                continue
+            instance = objects.get(src)
+            if instance is not None and (instance, attr) not in restored:
+                instance._dirty.discard(attr)
+
+    def __enter__(self):
+        self._token = _identity_scope.set(self)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        _identity_scope.reset(self._token)
+        self._identity_map.clear()
+        self._token = None
+
+
+def identity_scope():
+    return IdentityScope()
 
 
 # CURSOR REPRESENTATIONS.
@@ -9062,6 +9225,12 @@ class ModelObjectCursorWrapper(ModelDictCursorWrapper):
     valid_identifiers = True
 
     def __init__(self, cursor, model, select, constructor):
+        if hasattr(model, 'model'):
+            model = model.model
+        if hasattr(constructor, 'model'):
+            constructor = constructor.model
+        if isinstance(model, ModelAlias):
+            model = model.model
         self.constructor = constructor
         self.is_model = is_model(constructor)
         super(ModelObjectCursorWrapper, self).__init__(cursor, model, select)
@@ -9071,7 +9240,12 @@ class ModelObjectCursorWrapper(ModelDictCursorWrapper):
         if self.is_model:
             # Clear out any dirty fields before returning to the user.
             obj = self.constructor(__no_default__=1, **result)
-            obj._dirty.clear()
+            scope = _identity_scope.get()
+            if scope is not None:
+                obj._dirty.clear()
+                obj = scope.load(obj, is_cursor_row=True)
+            else:
+                obj._dirty.clear()
             return obj
         else:
             return self.constructor(**result)
@@ -9204,6 +9378,10 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
 
         default_instance = objects[self.model]
 
+        scope = _identity_scope.get()
+        canonical = {id(instance): instance for instance in model_list}
+        protected = {}
+
         set_keys = set()
         for idx, key, column, converter in self._row_spec:
             # Get the instance corresponding to the selected column/value,
@@ -9217,11 +9395,39 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
 
             if isinstance(instance, dict):
                 instance[column] = value
+            elif scope is not None:
+                model = type(instance)
+                key = scope._identity_key(model, instance)
+                existing = None if key is None else scope.identity_map.get(key)
+                if existing is not None and column in existing._dirty:
+                    if id(existing) not in protected:
+                        protected[id(existing)] = (
+                            set(existing._dirty),
+                            existing.__data__.copy(),
+                            existing.__rel__.copy())
+                    scope.conflicts.append(IdentityScopeConflict({
+                        'model': model,
+                        'identity': key[1],
+                        'field': column,
+                        'database_value': value,
+                        'local_value': existing.__data__[column],
+                    }))
+                    continue
+                setattr(instance, column, value)
+                instance._dirty.discard(column)
             else:
                 setattr(instance, column, value)
 
+        if scope is not None:
+            for instance in model_list:
+                instance._dirty.clear()
+            objects, canonical, protected = scope.merge_model_graph(
+                objects, model_list, protected)
+            default_instance = objects[self.model]
+
         # Need to do some analysis on the joins before this.
-        for (src, attr, dest, is_dict, is_outer, is_fk) in self.src_to_dest:
+        relations = self.src_to_dest
+        for (src, attr, dest, is_dict, is_outer, is_fk) in relations:
             instance = objects.get(src)
             joined_instance = objects.get(dest)
             if joined_instance is None and dest not in objects:
@@ -9253,9 +9459,11 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
             else:
                 setattr(instance, attr, joined_instance)
 
-        # When instantiating models from a cursor, we clear the dirty fields.
-        for instance in model_list:
-            instance._dirty.clear()
+        if scope is not None:
+            scope.restore_dirty_fields(objects, protected, relations)
+        else:
+            for instance in model_list:
+                instance._dirty.clear()
 
         return objects[self.model]
 

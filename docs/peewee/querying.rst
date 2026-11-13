@@ -81,6 +81,33 @@ fields. Peewee reconstructs the model graph from the result set:
    :ref:`relationships` covers joins in detail.
 
 
+Identity Scopes
+---------------
+
+Use :func:`identity_scope` when several model queries must share the same
+Python instance for a model and primary-key value. The cache belongs only to
+the ``with`` block and is released when the block exits:
+
+.. code-block:: python
+
+   with identity_scope() as scope:
+       first = User.get_by_id(1)
+       second = User.select().join(Tweet).where(User.id == 1).get()
+       assert first is second
+
+The rules are:
+
+- Rows are merged only when all primary-key columns are selected and non-null.
+- Model aliases use the underlying model class and primary key.
+- Clean fields are updated with the latest value returned by the database.
+- Dirty fields retain their local, unsaved value; each skipped overwrite is
+  recorded in ``scope.conflicts``.
+- Projections without a complete primary key and models without a primary key
+  are not merged.
+- Nested scopes have separate identity maps. Queries outside any scope retain
+  their normal per-query caching behavior.
+
+
 Retrieving a Single Record
 --------------------------
 
