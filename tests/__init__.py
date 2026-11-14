@@ -13,6 +13,8 @@ from . import db_tests
 MODULES.append(db_tests)
 from . import fields
 MODULES.append(fields)
+from . import join_graph_oracle
+MODULES.append(join_graph_oracle)
 from . import manytomany
 MODULES.append(manytomany)
 from . import models

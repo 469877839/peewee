@@ -9192,6 +9192,25 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
                 keep.append((src, attr, dest, is_dict, is_outer, is_fk))
         self.src_to_dest = keep
 
+        # Resolve the source foreign-key attribute name for each edge. A
+        # destination row can be genuinely matched even when every selected
+        # destination cell is NULL (e.g. only nullable payload columns were
+        # projected). In that case presence cannot rely on non-NULL cells:
+        # for a foreign-key edge, a non-NULL fk value means the database
+        # evaluated the join, and an all-NULL destination slice is a real
+        # matched row rather than an unmatched outer-join side. Names use
+        # each field's safe_name, which is how hydrated values are stored in
+        # ``Model.__data__`` (object-id name for foreign keys).
+        self._edge_src_fk = []
+        for src, attr, dest, is_dict, is_outer, is_fk in self.src_to_dest:
+            src_model = self.key_to_constructor.get(src)
+            src_fk_name = None
+            if is_fk and src_model is not None:
+                fk = src_model[0]._meta.fields.get(attr)
+                if fk is not None:
+                    src_fk_name = fk.safe_name
+            self._edge_src_fk.append(src_fk_name)
+
     def process_row(self, row):
         objects = {}
         model_list = []
@@ -9221,11 +9240,24 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
                 setattr(instance, column, value)
 
         # Need to do some analysis on the joins before this.
-        for (src, attr, dest, is_dict, is_outer, is_fk) in self.src_to_dest:
+        for edge, src_fk_name in zip(self.src_to_dest,
+                                     self._edge_src_fk):
+            (src, attr, dest, is_dict, is_outer, is_fk) = edge
             instance = objects.get(src)
             joined_instance = objects.get(dest)
             if joined_instance is None and dest not in objects:
                 continue
+
+            # When no selected destination cell is non-NULL, a foreign-key
+            # edge still points at a real matched row if the source carries
+            # a non-NULL fk value: the database only emits the (all-NULL)
+            # destination slice for a row that satisfied the join. This keeps
+            # an existing all-NULL payload row distinct from a genuinely
+            # unmatched outer-join side, which has a NULL fk.
+            key_matched = False
+            if (dest not in set_keys and src_fk_name is not None and
+                    isinstance(instance, Model)):
+                key_matched = instance.__data__.get(src_fk_name) is not None
 
             # Determine if anything further along in the graph is set.
             assign = False
@@ -9233,8 +9265,9 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
                 assign = bool(self._dest_reachable[dest] & set_keys)
 
             # If no fields were set on the destination instance then do not
-            # assign an "empty" instance.
-            if dest not in set_keys and not assign:
+            # assign an "empty" instance, unless the non-NULL fk proves the
+            # all-NULL destination row was actually matched.
+            if dest not in set_keys and not assign and not key_matched:
                 if is_outer:
                     joined_instance = None
                 else:
@@ -9242,7 +9275,8 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
 
             # If no fields were set on either the source or the destination,
             # then we have nothing to do here.
-            if src not in set_keys and dest not in set_keys and is_outer:
+            if (src not in set_keys and dest not in set_keys and
+                    not key_matched and is_outer):
                 continue
 
             if is_dict:
